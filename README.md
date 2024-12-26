@@ -1,5 +1,7 @@
 # DiskANN Implementation in Rust
 
+[![Rust](https://github.com/lukaesch/diskann-rs/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/lukaesch/diskann-rs/actions/workflows/rust.yml)
+
 A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) featuring a 3-layer index architecture and parallel query processing. This project provides an efficient and scalable solution for large-scale vector similarity search.
 
 ## Overview
