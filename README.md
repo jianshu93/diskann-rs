@@ -1,54 +1,70 @@
 # DiskANN Implementation in Rust
 
-A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) focused on learning, testing, and optimization. This project aims to create an easy-to-use library for large-scale vector similarity search that can be dropped into other projects.
+A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) featuring a 3-layer index architecture and parallel query processing. This project provides an efficient and scalable solution for large-scale vector similarity search.
 
 ## Overview
 
 This implementation provides a memory-efficient approach to similarity search by:
+- Using a 3-layer hierarchical index structure for faster search
 - Storing vectors on disk using memory mapping
 - Managing adjacency lists for graph-based search
+- Supporting parallel query processing
+- Implementing cluster-based graph construction
 - Supporting large-scale datasets that don't fit in RAM
-- Implementing approximate nearest neighbor search using graph traversal
 
 ## Features
 
+- Three-layer hierarchical index structure:
+  - Top layer (L0): Smallest, most selective layer
+  - Middle layer (L1): Intermediate connectivity
+  - Base layer (L2): Complete dataset
+- Cluster-based graph construction for meaningful adjacency
+- Parallel query processing using rayon
 - Memory-mapped vector storage for handling large datasets
 - Serialized adjacency lists for graph structure
-- Random index generation for testing
-- Basic BFS-like search implementation
 - Support for euclidean distance metric
-- Error handling with custom error types
+- Comprehensive error handling with custom error types
 
 ## Usage
 
-### Building an Index
+### Building a 3-Layer Index
 
 ```rust
-let index = LargeScaleDiskANN::build_index_on_disk(
-    1_000_000,    // number of vectors
-    128,          // dimension
-    64,           // max neighbors per node
-    "vectors.bin", // path to store vectors
-    "adjacency.bin" // path to store adjacency lists
+let index = MultiLayerDiskANN::build_index_on_disk(
+    1_000_000,        // number of vectors
+    128,              // dimension
+    32,               // max neighbors per node
+    0.01,             // fraction of vectors in top layer
+    0.1,              // fraction of vectors in middle layer
+    "vectors.bin",    // path to store vectors
+    "adjacency.bin",  // path to store adjacency lists
+    "metadata.bin"    // path to store metadata
 )?;
 ```
 
 ### Opening an Existing Index
 
 ```rust
-let index = LargeScaleDiskANN::open_index(
+let index = MultiLayerDiskANN::open_index(
     "vectors.bin",
     "adjacency.bin",
-    128  // dimension
+    "metadata.bin"
 )?;
 ```
 
-### Searching
+### Parallel Search
 
 ```rust
-let query: Vec<f32> = vec![/* your query vector */];
-let k = 10; // number of nearest neighbors to find
-let neighbors = index.search(&query, k);
+use rayon::prelude::*;
+
+// Create shared index reference
+let index = Arc::new(index);
+
+// Perform parallel queries
+let results: Vec<Vec<u32>> = query_batch
+    .par_iter()
+    .map(|query| index.search(query, k, beam_width))
+    .collect();
 ```
 
 ## Performance Characteristics
@@ -56,17 +72,19 @@ let neighbors = index.search(&query, k);
 - Memory Usage: O(1) for vector storage due to memory mapping
 - Disk Space: 
   - Vectors: num_vectors * dimension * 4 bytes
-  - Adjacency Lists: Depends on max_degree setting
-- Search Time: Depends on graph structure and dataset size
+  - Adjacency Lists: Varies by layer size and max_degree
+- Search Time: Logarithmic due to hierarchical structure
+- Parallel Processing: Scales with available CPU cores
 
 ## Current Status
 
-This is a learning implementation focused on understanding DiskANN's core concepts. Current areas of focus:
-- [ ] Optimizing graph construction
-- [ ] Implementing better search strategies
-- [ ] Benchmarking and profiling
-- [ ] Adding more distance metrics
-- [ ] Improving memory efficiency
+This implementation features:
+- [x] 3-layer hierarchical index structure
+- [x] Cluster-based graph construction
+- [x] Parallel query processing
+- [x] Memory-mapped I/O
+- [x] Efficient disk-based storage
+- [x] Beam search implementation
 
 ## Building and Testing
 
@@ -74,18 +92,18 @@ This is a learning implementation focused on understanding DiskANN's core concep
 # Build in release mode
 cargo build --release
 
-# Run the demo
+# Run the demo with parallel queries
 cargo run --release
 ```
 
 ## Future Improvements
 
-1. Implement proper graph construction using proximity information
+1. Implement more sophisticated graph construction algorithms
 2. Add support for multiple distance metrics
-3. Optimize search algorithm
-4. Add batch processing capabilities
-5. Implement proper parameter tuning
-6. Add comprehensive benchmarking suite
+3. Further optimize search algorithm
+4. Add dynamic index updates
+5. Implement advanced parameter tuning
+6. Expand benchmarking suite
 
 ## Contributing
 
@@ -96,4 +114,4 @@ This is a learning project, and contributions or suggestions are welcome! Feel f
 
 ## References
 
-- Original DiskANN paper: [[link](https://www.microsoft.com/en-us/research/publication/diskann-fast-accurate-billion-point-nearest-neighbor-search-on-a-single-node/?msockid=1b74891036f76220363b98c3379c6384)]
+- Original DiskANN paper: [[link](https://www.microsoft.com/en-us/research/publication/diskann-fast-accurate-billion-point-nearest-neighbor-search-on-a-single-node/)]
