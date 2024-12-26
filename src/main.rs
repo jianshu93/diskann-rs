@@ -1,41 +1,61 @@
+use std::{
+    fs::{File, OpenOptions},
+    io::{Seek, SeekFrom, Write},
+    os::unix::fs::FileExt, // for read_at / write_at
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
+
 use bytemuck;
 use memmap2::Mmap;
 use rand::prelude::{Rng, SliceRandom};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs::{File, OpenOptions},
-    os::unix::fs::FileExt, // <-- for read_at / write_at
-    path::Path,
-    sync::Arc,
-    time::Instant,
-};
 use thiserror::Error;
 
-/// =============================
-///         ERROR TYPE
-/// =============================
+// =============================
+//         ERROR TYPE
+// =============================
 #[derive(Debug, Error)]
-pub enum DiskAnnTestError {
-    #[error("I/O Error: {0}")]
+pub enum DiskAnnError {
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("Serialization Error: {0}")]
+    #[error("Serialization error: {0}")]
     Bincode(#[from] bincode::Error),
-    #[error("Index Error: {0}")]
+    #[error("Index error: {0}")]
     IndexError(String),
 }
 
-/// =============================
-///      METADATA STRUCTS
-/// =============================
+// =============================
+//     SINGLE-FILE METADATA
+// =============================
+#[derive(Serialize, Deserialize, Debug)]
+struct SingleFileMetadata {
+    dim: usize,
+    num_vectors: usize,
+    max_degree: usize,
 
-/// We’ll build THREE layers:
-///   L0 (top)    => fraction_top
-///   L1 (middle) => fraction_mid
-///   L2 (base)   => 100%
-/// We store adjacency for each layer in a single file (separate offsets).
-#[derive(Serialize, Deserialize)]
-struct MultiLayerMetadata {
+    fraction_top: f64,
+    fraction_mid: f64,
+
+    layer0_ids: Vec<u32>,
+    layer1_ids: Vec<u32>,
+
+    // Where the vector data starts
+    vectors_offset: u64,
+    // Where adjacency data starts
+    adjacency_offset: u64,
+
+    offset_layer0: usize,
+    offset_layer1: usize,
+    offset_layer2: usize,
+}
+
+// =============================
+//     SINGLE-FILE DISKANN
+// =============================
+pub struct SingleFileDiskANN {
     dim: usize,
     num_vectors: usize,
     max_degree: usize,
@@ -49,72 +69,48 @@ struct MultiLayerMetadata {
     offset_layer0: usize,
     offset_layer1: usize,
     offset_layer2: usize,
+
+    vectors_offset: u64,
+    adjacency_offset: u64,
+
+    file: File,
+    mmap: Mmap,
 }
 
-/// =============================
-///    DISKANN-LIKE STRUCT
-/// =============================
-pub struct MultiLayerDiskANN {
-    dim: usize,
-    num_vectors: usize,
-
-    max_degree: usize,
-
-    fraction_top: f64,
-    fraction_mid: f64,
-
-    #[allow(dead_code)]
-    vectors_file: File, // read-only
-    vectors_mmap: Mmap,
-
-    #[allow(dead_code)]
-    adjacency_file: File, // read-only
-    adjacency_mmap: Mmap,
-
-    layer0_ids: Vec<u32>,
-    layer1_ids: Vec<u32>,
-
-    offset_layer0: usize,
-    offset_layer1: usize,
-    offset_layer2: usize,
-}
-
-/// =============================
-///      BUILDING THE INDEX
-/// =============================
-impl MultiLayerDiskANN {
-    /// Build a 3-layer index on disk with a naive "cluster-based" adjacency.
-    pub fn build_index_on_disk(
+impl SingleFileDiskANN {
+    /// Build everything in a single file (header + vectors + adjacency)
+    /// with parallel adjacency building.
+    pub fn build_index_singlefile(
         num_vectors: usize,
         dim: usize,
         max_degree: usize,
         fraction_top: f64,
         fraction_mid: f64,
-        vectors_path: &str,
-        adjacency_path: &str,
-        metadata_path: &str,
-    ) -> Result<Self, DiskAnnTestError> {
-        // 1) Generate random vectors on disk
-        println!(
-            "Generating {} random vectors of dim {} => ~{:.2} GB on disk...",
-            num_vectors,
-            dim,
-            (num_vectors as f64 * dim as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0)
-        );
-        let vfile = OpenOptions::new()
+        singlefile_path: &str,
+    ) -> Result<Self, DiskAnnError> {
+        // 1) Create the file
+        let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .read(true)
             .truncate(true)
-            .open(vectors_path)?;
+            .open(singlefile_path)?;
 
-        let total_bytes = num_vectors * dim * 4;
-        vfile.set_len(total_bytes as u64)?;
+        let vectors_offset = 1024 * 1024; // 1MB offset for the header
+
+        // total bytes for vectors
+        let total_vector_bytes = (num_vectors as u64) * (dim as u64) * 4;
+        // generate random vectors
+        println!(
+            "Generating {} random vectors of dim {} => ~{:.2}GB on disk...",
+            num_vectors,
+            dim,
+            (num_vectors as f64 * dim as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0)
+        );
 
         let mut rng = rand::thread_rng();
         let chunk_size = 100_000;
         let mut buffer = Vec::with_capacity(chunk_size * dim);
-
         let gen_start = Instant::now();
         let mut written = 0usize;
         while written < num_vectors {
@@ -128,121 +124,110 @@ impl MultiLayerDiskANN {
                 }
             }
             let bytes = bytemuck::cast_slice(&buffer);
-            // write at offset = written * dim * 4
-            let offset = (written * dim * 4) as u64;
-            vfile.write_at(bytes, offset)?; // <-- no seek, just write_at
+            let offset = vectors_offset + (written * dim * 4) as u64;
+            file.write_at(bytes, offset)?;
             written += batch;
         }
-        // done
         let gen_time = gen_start.elapsed().as_secs_f32();
         println!("Vector generation took {:.2} s", gen_time);
 
-        // 2) Choose L0 and L1 IDs
+        // pick layer subsets
         let mut all_ids: Vec<u32> = (0..num_vectors as u32).collect();
         all_ids.shuffle(&mut rng);
-
         let size_l0 = (num_vectors as f64 * fraction_top).ceil() as usize;
         let size_l1 = (num_vectors as f64 * fraction_mid).ceil() as usize;
         let size_l1 = size_l1.max(size_l0);
 
-        let layer0_ids = &all_ids[..size_l0];
-        let layer1_ids = &all_ids[..size_l1];
-        let mut l0 = layer0_ids.to_vec();
-        let mut l1 = layer1_ids.to_vec();
-
-        l0.sort_unstable();
-        l1.sort_unstable();
+        let l0slice = &all_ids[..size_l0];
+        let l1slice = &all_ids[..size_l1];
+        let mut layer0_ids = l0slice.to_vec();
+        let mut layer1_ids = l1slice.to_vec();
+        layer0_ids.sort_unstable();
+        layer1_ids.sort_unstable();
 
         println!(
             "Layer0 size={}, Layer1 size={}, total={}",
             size_l0, size_l1, num_vectors
         );
 
-        // 3) Build adjacency (cluster-based)
-        let cluster_count = 20;
-        let centroids = pick_random_centroids(cluster_count, &vfile, dim, num_vectors)?;
-
+        // adjacency offsets
         let bytes_per_node = max_degree * 4;
         let offset_layer0 = 0;
         let offset_layer1 = size_l0 * bytes_per_node;
         let offset_layer2 = offset_layer1 + (size_l1 * bytes_per_node);
-
         let total_adj_bytes = offset_layer2 + (num_vectors * bytes_per_node);
 
-        let afile = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .read(true)
-            .truncate(true)
-            .open(adjacency_path)?;
-        afile.set_len(total_adj_bytes as u64)?;
+        let adjacency_offset = vectors_offset + total_vector_bytes;
+        let adjacency_end = adjacency_offset + (total_adj_bytes as u64);
+        file.set_len(adjacency_end)?;
 
-        // build adjacency for L0
-        build_layer_adjacency(
-            &afile,
+        // pick random centroids
+        let cluster_count = 20;
+        let centroids =
+            pick_random_centroids(cluster_count, &file, vectors_offset, dim, num_vectors)?;
+
+        // 2) Build adjacency in parallel
+        let build_start = Instant::now();
+        build_layer_adjacency_parallel(
+            &file,
+            adjacency_offset,
             offset_layer0,
-            &l0,
+            &layer0_ids,
             dim,
             max_degree,
-            &vfile,
+            vectors_offset,
             &centroids,
         )?;
-
-        // build adjacency for L1
-        build_layer_adjacency(
-            &afile,
+        build_layer_adjacency_parallel(
+            &file,
+            adjacency_offset,
             offset_layer1,
-            &l1,
+            &layer1_ids,
             dim,
             max_degree,
-            &vfile,
+            vectors_offset,
             &centroids,
         )?;
-
-        // build adjacency for all (base)
+        // base layer => all IDs
         let base_ids: Vec<u32> = (0..num_vectors as u32).collect();
-        build_layer_adjacency(
-            &afile,
+        build_layer_adjacency_parallel(
+            &file,
+            adjacency_offset,
             offset_layer2,
             &base_ids,
             dim,
             max_degree,
-            &vfile,
+            vectors_offset,
             &centroids,
         )?;
+        let build_time = build_start.elapsed().as_secs_f32();
+        println!("Parallel adjacency build took {:.2} s", build_time);
 
-        println!("Done building 3-layer index.");
-
-        // 4) Write metadata
-        let meta = MultiLayerMetadata {
+        // 3) Write metadata at offset 0
+        let metadata = SingleFileMetadata {
             dim,
             num_vectors,
             max_degree,
             fraction_top,
             fraction_mid,
-            layer0_ids: l0,
-            layer1_ids: l1,
+            layer0_ids,
+            layer1_ids,
+            vectors_offset,
+            adjacency_offset,
             offset_layer0,
             offset_layer1,
             offset_layer2,
         };
-        let mbytes = bincode::serialize(&meta)?;
-        std::fs::write(metadata_path, &mbytes)?;
+        let md_bytes = bincode::serialize(&metadata)?;
+        // [u64: md_len][md_bytes...]
+        file.seek(SeekFrom::Start(0))?;
+        let md_len = md_bytes.len() as u64;
+        file.write_all(&md_len.to_le_bytes())?;
+        file.write_all(&md_bytes)?;
+        file.sync_all()?;
 
-        println!("Index build complete.");
-
-        // 5) Memory-map
-        let vectors_file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(vectors_path)?;
-        let vectors_mmap = unsafe { Mmap::map(&vectors_file)? };
-
-        let adjacency_file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(adjacency_path)?;
-        let adjacency_mmap = unsafe { Mmap::map(&adjacency_file)? };
+        // 4) memory-map entire file
+        let mmap = unsafe { Mmap::map(&file)? };
 
         Ok(Self {
             dim,
@@ -250,181 +235,56 @@ impl MultiLayerDiskANN {
             max_degree,
             fraction_top,
             fraction_mid,
-            vectors_file,
-            vectors_mmap,
-            adjacency_file,
-            adjacency_mmap,
-            layer0_ids: meta.layer0_ids,
-            layer1_ids: meta.layer1_ids,
-            offset_layer0: meta.offset_layer0,
-            offset_layer1: meta.offset_layer1,
-            offset_layer2: meta.offset_layer2,
+            layer0_ids: metadata.layer0_ids,
+            layer1_ids: metadata.layer1_ids,
+            offset_layer0: metadata.offset_layer0,
+            offset_layer1: metadata.offset_layer1,
+            offset_layer2: metadata.offset_layer2,
+            vectors_offset: metadata.vectors_offset,
+            adjacency_offset: metadata.adjacency_offset,
+            file,
+            mmap,
         })
     }
 
-    /// Open existing index
-    pub fn open_index(
-        vectors_path: &str,
-        adjacency_path: &str,
-        metadata_path: &str,
-    ) -> Result<Self, DiskAnnTestError> {
-        let mbytes = std::fs::read(metadata_path)?;
-        let meta: MultiLayerMetadata = bincode::deserialize(&mbytes)?;
+    /// Open existing single-file
+    pub fn open_index_singlefile(path: &str) -> Result<Self, DiskAnnError> {
+        let file = OpenOptions::new().read(true).write(false).open(path)?;
+        let mut buf8 = [0u8; 8];
+        file.read_at(&mut buf8, 0)?;
+        let md_len = u64::from_le_bytes(buf8);
+        let mut md_bytes = vec![0u8; md_len as usize];
+        file.read_at(&mut md_bytes, 8)?;
+        let metadata: SingleFileMetadata = bincode::deserialize(&md_bytes)?;
 
-        let vectors_file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(vectors_path)?;
-        let vectors_mmap = unsafe { Mmap::map(&vectors_file)? };
-
-        let adjacency_file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(adjacency_path)?;
-        let adjacency_mmap = unsafe { Mmap::map(&adjacency_file)? };
+        let mmap = unsafe { Mmap::map(&file)? };
 
         Ok(Self {
-            dim: meta.dim,
-            num_vectors: meta.num_vectors,
-            max_degree: meta.max_degree,
-            fraction_top: meta.fraction_top,
-            fraction_mid: meta.fraction_mid,
-            vectors_file,
-            vectors_mmap,
-            adjacency_file,
-            adjacency_mmap,
-            layer0_ids: meta.layer0_ids,
-            layer1_ids: meta.layer1_ids,
-            offset_layer0: meta.offset_layer0,
-            offset_layer1: meta.offset_layer1,
-            offset_layer2: meta.offset_layer2,
+            dim: metadata.dim,
+            num_vectors: metadata.num_vectors,
+            max_degree: metadata.max_degree,
+            fraction_top: metadata.fraction_top,
+            fraction_mid: metadata.fraction_mid,
+            layer0_ids: metadata.layer0_ids,
+            layer1_ids: metadata.layer1_ids,
+            offset_layer0: metadata.offset_layer0,
+            offset_layer1: metadata.offset_layer1,
+            offset_layer2: metadata.offset_layer2,
+            vectors_offset: metadata.vectors_offset,
+            adjacency_offset: metadata.adjacency_offset,
+            file,
+            mmap,
         })
     }
-}
 
-/// =============================
-///   1) Meaningful Adjacency
-/// =============================
-
-/// We'll do a naive "cluster-based" approach:
-///   - pick `cluster_count` random centroids
-///   - for each node, find the centroid it's closest to
-///   - among that centroid's sample, pick up to max_degree nearest neighbors
-fn pick_random_centroids(
-    cluster_count: usize,
-    file: &File,
-    dim: usize,
-    num_vectors: usize,
-) -> Result<Vec<(usize, Vec<f32>)>, DiskAnnTestError> {
-    let mut rng = rand::thread_rng();
-    let mut cents = Vec::with_capacity(cluster_count);
-    for _ in 0..cluster_count {
-        let id = rng.gen_range(0..num_vectors);
-        let vec = read_vector(file, dim, id)?;
-        cents.push((id, vec));
-    }
-    Ok(cents)
-}
-
-/// Builds adjacency for a given layer's node IDs, storing the result in `afile` at `offset_start`.
-fn build_layer_adjacency(
-    afile: &File, // <-- read_at, write_at
-    offset_start: usize,
-    layer_ids: &[u32],
-    dim: usize,
-    max_degree: usize,
-    vectors_file: &File,
-    centroids: &Vec<(usize, Vec<f32>)>,
-) -> Result<(), DiskAnnTestError> {
-    let cluster_count = centroids.len();
-    let mut buckets = vec![Vec::new(); cluster_count];
-
-    // 1) assign each node to its nearest centroid
-    for &nid in layer_ids {
-        let nvec = read_vector(vectors_file, dim, nid as usize)?;
-        let mut best_c = 0;
-        let mut best_d = f32::MAX;
-        for (cidx, (_, cvec)) in centroids.iter().enumerate() {
-            let d = euclidean_distance(&nvec, cvec);
-            if d < best_d {
-                best_d = d;
-                best_c = cidx;
-            }
-        }
-        buckets[best_c].push(nid);
-    }
-
-    // 2) For each bucket, pick up to max_degree neighbors from a partial sample
-    for bucket in &buckets {
-        let bucket_size = bucket.len();
-        if bucket_size <= 1 {
-            continue;
-        }
-
-        let sample_size = 256.min(bucket_size);
-        let mut rng = rand::thread_rng();
-        let mut sample_indices = bucket.clone();
-        sample_indices.shuffle(&mut rng);
-        sample_indices.truncate(sample_size);
-
-        // read each sample vector
-        let mut sample_vecs = Vec::with_capacity(sample_size);
-        for &sid in &sample_indices {
-            let v = read_vector(vectors_file, dim, sid as usize)?;
-            sample_vecs.push((sid, v));
-        }
-
-        // compute adjacency for each node in bucket
-        for &nid in bucket {
-            let node_off = offset_start + (nid as usize * max_degree * 4);
-
-            let nv = read_vector(vectors_file, dim, nid as usize)?;
-            let mut dists = Vec::with_capacity(sample_vecs.len());
-            for (sid, sv) in &sample_vecs {
-                if *sid != nid {
-                    let d = euclidean_distance(&nv, sv);
-                    dists.push((*sid, d));
-                }
-            }
-            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            dists.truncate(max_degree);
-
-            let mut nbrs: Vec<u32> = dists.iter().map(|(id, _)| *id).collect();
-            while nbrs.len() < max_degree {
-                nbrs.push(0);
-            }
-
-            let bytes_slice = bytemuck::cast_slice(&nbrs);
-            afile.write_at(bytes_slice, node_off as u64)?; // no seek, just write_at
-        }
-    }
-
-    Ok(())
-}
-
-/// =============================
-///       LAYERED SEARCH
-/// =============================
-impl MultiLayerDiskANN {
-    /// 3-layer search: L0 -> L1 -> L2. We only use the final L2 search to get top-k.
+    /// 3-layer search
     pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
-        // we won't use these, so let's prefix them with `_`
-        let _entry_l0 =
-            self.search_layer(query, &self.layer0_ids, self.offset_layer0, beam_width, 1);
-        let _entry_l1 =
-            self.search_layer(query, &self.layer1_ids, self.offset_layer1, beam_width, 1);
-
-        // final top-k from base
-        self.search_layer(
-            query,
-            &(0..self.num_vectors as u32).collect::<Vec<u32>>(),
-            self.offset_layer2,
-            beam_width,
-            k,
-        )
+        let _l0 = self.search_layer(query, &self.layer0_ids, self.offset_layer0, beam_width, 1);
+        let _l1 = self.search_layer(query, &self.layer1_ids, self.offset_layer1, beam_width, 1);
+        let base_ids: Vec<u32> = (0..self.num_vectors as u32).collect();
+        self.search_layer(query, &base_ids, self.offset_layer2, beam_width, k)
     }
 
-    /// best-first beam search with up to `k` final neighbors
     fn search_layer(
         &self,
         query: &[f32],
@@ -433,6 +293,9 @@ impl MultiLayerDiskANN {
         beam_width: usize,
         k: usize,
     ) -> Vec<u32> {
+        if layer_ids.is_empty() {
+            return vec![];
+        }
         use std::cmp::Ordering;
         use std::collections::BinaryHeap;
 
@@ -449,7 +312,6 @@ impl MultiLayerDiskANN {
         impl Eq for Candidate {}
         impl PartialOrd for Candidate {
             fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                // max-heap by distance
                 other.dist.partial_cmp(&self.dist)
             }
         }
@@ -457,10 +319,6 @@ impl MultiLayerDiskANN {
             fn cmp(&self, other: &Self) -> Ordering {
                 self.partial_cmp(other).unwrap_or(Ordering::Equal)
             }
-        }
-
-        if layer_ids.is_empty() {
-            return vec![];
         }
 
         let mut rng = rand::thread_rng();
@@ -479,19 +337,17 @@ impl MultiLayerDiskANN {
             dist: start_dist,
             node_id: start_id,
         }];
-        if let Some(&idx) = id_to_idx.get(&start_id) {
-            visited[idx] = true;
+        if let Some(&layer_idx) = id_to_idx.get(&start_id) {
+            visited[layer_idx] = true;
         }
 
-        let mut best_candidates = BinaryHeap::new();
-        best_candidates.push(frontier[0].clone());
+        let mut best = BinaryHeap::new();
+        best.push(frontier[0].clone());
 
         while let Some(current) = frontier.pop() {
             let neighbors = self.get_layer_neighbors(current.node_id, layer_offset);
-            // expand
             for &nbr in neighbors {
                 if nbr == 0 {
-                    // ignore dummy
                     continue;
                 }
                 if let Some(&nbr_idx) = id_to_idx.get(&nbr) {
@@ -503,54 +359,165 @@ impl MultiLayerDiskANN {
                             node_id: nbr,
                         };
                         frontier.push(cand.clone());
-                        best_candidates.push(cand);
-                        if best_candidates.len() > beam_width {
-                            best_candidates.pop();
+                        best.push(cand);
+                        if best.len() > beam_width {
+                            best.pop();
                         }
                     }
                 }
             }
         }
 
-        let mut final_vec = best_candidates.into_vec();
+        let mut final_vec = best.into_vec();
         final_vec.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
         final_vec.truncate(k);
-
         final_vec.into_iter().map(|c| c.node_id).collect()
     }
 
-    /// get adjacency for a node in the given layer
     fn get_layer_neighbors(&self, node_id: u32, layer_offset: usize) -> &[u32] {
-        let start = layer_offset + (node_id as usize * self.max_degree * 4);
+        let node_off = layer_offset + (node_id as usize * self.max_degree * 4);
+        let start = (self.adjacency_offset as usize) + node_off;
         let end = start + (self.max_degree * 4);
-        let bytes = &self.adjacency_mmap[start..end];
+        let bytes = &self.mmap[start..end];
         bytemuck::cast_slice(bytes)
     }
 
-    /// distance to vector #idx
     fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
-        let start = idx * self.dim * 4;
+        let vector_offset = self.vectors_offset + (idx * self.dim * 4) as u64;
+        let start = vector_offset as usize;
         let end = start + (self.dim * 4);
-        let bytes = &self.vectors_mmap[start..end];
-        let vec_f32: &[f32] = bytemuck::cast_slice(bytes);
-        euclidean_distance(query, vec_f32)
+        let bytes = &self.mmap[start..end];
+        let vecf: &[f32] = bytemuck::cast_slice(bytes);
+        euclidean_distance(query, vecf)
     }
 }
 
-/// =============================
-///   HELPER: read a vector
-/// =============================
+// =============================
+//     PARALLEL BUILD LOGIC
+// =============================
 
-/// We use `read_at` so we don't need a mutable `File`.
-fn read_vector(file: &File, dim: usize, idx: usize) -> Result<Vec<f32>, DiskAnnTestError> {
-    let offset = (idx * dim * 4) as u64;
-    let mut vbytes = vec![0u8; dim * 4];
-    file.read_at(&mut vbytes, offset)?;
-    let floats: &[f32] = bytemuck::cast_slice(&vbytes);
+/// Build adjacency using your naive cluster-based approach, **in parallel**.
+fn build_layer_adjacency_parallel(
+    file: &File,
+    adjacency_offset: u64,
+    layer_offset: usize,
+    layer_ids: &[u32],
+    dim: usize,
+    max_degree: usize,
+    vectors_offset: u64,
+    centroids: &[(usize, Vec<f32>)],
+) -> Result<(), DiskAnnError> {
+    if layer_ids.is_empty() {
+        return Ok(());
+    }
+    // 1) Parallel assignment of node -> centroid
+    let node_assignments: Vec<(usize, u32)> = layer_ids
+        .par_iter()
+        .map(|&nid| {
+            let nv = read_vector(file, vectors_offset, dim, nid as usize).unwrap();
+            let mut best_c = 0;
+            let mut best_d = f32::MAX;
+            for (cidx, (_, cvec)) in centroids.iter().enumerate() {
+                let d = euclidean_distance(&nv, cvec);
+                if d < best_d {
+                    best_d = d;
+                    best_c = cidx;
+                }
+            }
+            (best_c, nid)
+        })
+        .collect();
+
+    // 2) Now place them into buckets
+    let cluster_count = centroids.len();
+    let mut buckets = vec![Vec::new(); cluster_count];
+    for (cidx, nid) in node_assignments {
+        buckets[cidx].push(nid);
+    }
+
+    // 3) Parallel build adjacency per bucket
+    buckets.into_par_iter().for_each(|bucket| {
+        if bucket.len() <= 1 {
+            return;
+        }
+        let mut rng = rand::thread_rng();
+        let sample_size = 256.min(bucket.len());
+        let mut sample_ids = bucket.clone();
+        sample_ids.shuffle(&mut rng);
+        sample_ids.truncate(sample_size);
+
+        // read vectors for sample
+        let sample_vecs: Vec<(u32, Vec<f32>)> = sample_ids
+            .iter()
+            .map(|&sid| {
+                let v = read_vector(file, vectors_offset, dim, sid as usize).unwrap();
+                (sid, v)
+            })
+            .collect();
+
+        // Now build adjacency for each node in the bucket, but do it in parallel
+        // because each node writes to a unique offset in the file => no overlap
+        bucket.par_iter().for_each(|&nid| {
+            let nv = read_vector(file, vectors_offset, dim, nid as usize).unwrap();
+            let mut dists = Vec::with_capacity(sample_vecs.len());
+            for (sid, sv) in &sample_vecs {
+                if *sid != nid {
+                    let d = euclidean_distance(&nv, sv);
+                    dists.push((*sid, d));
+                }
+            }
+            dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            dists.truncate(max_degree);
+
+            let mut nbrs: Vec<u32> = dists.iter().map(|(id, _)| *id).collect();
+            while nbrs.len() < max_degree {
+                nbrs.push(0);
+            }
+
+            let node_off = layer_offset + (nid as usize * max_degree * 4);
+            let off = adjacency_offset + node_off as u64;
+            let bytes = bytemuck::cast_slice(&nbrs);
+            // safe to write at unique offset from parallel threads
+            file.write_at(bytes, off).unwrap();
+        });
+    });
+
+    Ok(())
+}
+
+// =============================
+//   READ & DISTANCE HELPERS
+// =============================
+fn pick_random_centroids(
+    cluster_count: usize,
+    file: &File,
+    vectors_offset: u64,
+    dim: usize,
+    num_vectors: usize,
+) -> Result<Vec<(usize, Vec<f32>)>, DiskAnnError> {
+    let mut rng = rand::thread_rng();
+    let mut cents = Vec::with_capacity(cluster_count);
+    for _ in 0..cluster_count {
+        let id = rng.gen_range(0..num_vectors);
+        let vec = read_vector(file, vectors_offset, dim, id)?;
+        cents.push((id, vec));
+    }
+    Ok(cents)
+}
+
+fn read_vector(
+    file: &File,
+    vectors_offset: u64,
+    dim: usize,
+    idx: usize,
+) -> Result<Vec<f32>, DiskAnnError> {
+    let off = vectors_offset + (idx * dim * 4) as u64;
+    let mut buf = vec![0u8; dim * 4];
+    file.read_at(&mut buf, off)?;
+    let floats: &[f32] = bytemuck::cast_slice(&buf);
     Ok(floats.to_vec())
 }
 
-/// Euclidean distance
 fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
@@ -559,85 +526,64 @@ fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
         .sqrt()
 }
 
-/// =============================
-///       MAIN DEMO
-/// =============================
-fn main() -> Result<(), DiskAnnTestError> {
-    // Large scale same as BFS version
+// =============================
+//         DEMO MAIN
+// =============================
+fn main() -> Result<(), DiskAnnError> {
     const NUM_VECTORS: usize = 1_000_000;
     const DIM: usize = 1536;
     const MAX_DEGREE: usize = 32;
     const FRACTION_TOP: f64 = 0.01;
-    const FRACTION_MID: f64 = 0.1;
+    const FRACTION_MID: f64 = 0.10;
 
-    let vectors_path = "vectors.bin";
-    let adjacency_path = "adjacency.bin";
-    let metadata_path = "metadata.bin";
+    let singlefile_path = "diskann_parallel.db";
 
-    // Build if not exists
-    if !Path::new(vectors_path).exists() {
-        println!("Building 3-layer index on disk...");
+    // 1) Build if missing
+    if !Path::new(singlefile_path).exists() {
+        println!("Building single-file index at {singlefile_path} with parallel adjacency...");
         let start = Instant::now();
-        MultiLayerDiskANN::build_index_on_disk(
+        let index = SingleFileDiskANN::build_index_singlefile(
             NUM_VECTORS,
             DIM,
             MAX_DEGREE,
             FRACTION_TOP,
             FRACTION_MID,
-            vectors_path,
-            adjacency_path,
-            metadata_path,
+            singlefile_path,
         )?;
-        let elapsed = start.elapsed().as_secs_f32();
-        println!("Done building. Elapsed = {:.2} s", elapsed);
+        let build_time = start.elapsed().as_secs_f32();
+        println!("Done building index in {build_time:.2} s");
     } else {
-        println!("Index already exists, skipping build.");
+        println!("Index file {singlefile_path} already exists, skipping build.");
     }
 
-    // Open
+    // 2) Open
     let open_start = Instant::now();
-    let index = Arc::new(MultiLayerDiskANN::open_index(
-        vectors_path,
-        adjacency_path,
-        metadata_path,
-    )?);
+    let index = Arc::new(SingleFileDiskANN::open_index_singlefile(singlefile_path)?);
     let open_time = open_start.elapsed().as_secs_f32();
     println!(
-        "Opened 3-layer index with {} vectors, dim={}, top fraction={}, mid fraction={} in {:.2} s",
-        index.num_vectors, index.dim, index.fraction_top, index.fraction_mid, open_time
+        "Opened index with {} vectors, dim={} in {:.2} s",
+        index.num_vectors, index.dim, open_time
     );
 
-    // We'll do concurrency for queries with rayon
+    // 3) Queries
     let queries = 5;
     let k = 10;
     let beam_width = 64;
+    let mut rng = rand::thread_rng();
 
     let search_start = Instant::now();
-
-    // generate queries in a vector
-    let mut rng = rand::thread_rng();
-    let mut query_batch = Vec::new();
+    let mut qvecs = Vec::new();
     for _ in 0..queries {
         let q: Vec<f32> = (0..index.dim).map(|_| rng.gen()).collect();
-        query_batch.push(q);
+        qvecs.push(q);
     }
-
-    // parallelize the queries with rayon
-    let _results: Vec<Vec<u32>> = query_batch
-        .par_iter()
-        .enumerate()
-        .map(|(i, query)| {
-            let knn = index.search(query, k, beam_width);
-            println!("Query {i} => top-{k} neighbors = {:?}", knn);
-            knn
-        })
-        .collect();
-
+    // parallel queries
+    qvecs.par_iter().enumerate().for_each(|(i, query)| {
+        let knn = index.search(query, k, beam_width);
+        println!("Query {i} => top-{k} neighbors = {knn:?}");
+    });
     let search_time = search_start.elapsed().as_secs_f32();
-    println!(
-        "Performed {queries} queries (in parallel) in {search_time:.2} s (~{:.2} s/query avg)",
-        search_time / queries as f32
-    );
+    println!("Performed {queries} queries in {search_time:.2} s");
 
     Ok(())
 }
