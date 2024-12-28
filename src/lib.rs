@@ -1,5 +1,37 @@
-//! diskannrs - A DiskANN-like Rust library with single-file storage
-//! including Euclidean or Cosine distance and basic tests.
+//! # DiskAnnRS
+//!
+//! A DiskANN-like Rust library implementing approximate nearest neighbor search with
+//! single-file storage support. The library provides both Euclidean distance and
+//! Cosine similarity metrics, with a three-layer hierarchical search structure.
+//!
+//! ## Features
+//!
+//! - Single-file storage format
+//! - Support for both Euclidean and Cosine distance metrics
+//! - Parallel index construction using Rayon
+//! - Memory-mapped file access for efficient searches
+//! - Three-layer hierarchical search structure
+//!
+//! ## Example
+//!
+//! ```rust,no_run
+//! use diskannrs::{SingleFileDiskANN, DistanceMetric};
+//!
+//! // Build a new index
+//! let index = SingleFileDiskANN::build_index_singlefile(
+//!     1000,    // number of vectors
+//!     128,     // dimensionality
+//!     32,      // maximum degree
+//!     0.1,     // fraction of vectors in top layer
+//!     0.2,     // fraction of vectors in middle layer
+//!     DistanceMetric::Euclidean,
+//!     "index.db"
+//! ).unwrap();
+//!
+//! // Search the index
+//! let query = vec![0.0; 128];  // your query vector
+//! let neighbors = index.search(&query, 10, 64);  // find top 10 with beam width 64
+//! ```
 
 use bytemuck;
 use memmap2::Mmap;
@@ -15,72 +47,90 @@ use std::{
 };
 use thiserror::Error;
 
-/// Custom error type for our library
+/// Custom error type for DiskAnnRS operations
 #[derive(Debug, Error)]
 pub enum DiskAnnError {
+    /// Represents I/O errors during file operations
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Represents serialization/deserialization errors
     #[error("Serialization error: {0}")]
     Bincode(#[from] bincode::Error),
+
+    /// Represents index-specific errors
     #[error("Index error: {0}")]
     IndexError(String),
 }
 
-/// DistanceMetric allows either Euclidean distance or Cosine similarity.
-/// We'll interpret "distance" for Cosine as `1 - cos(...)` so smaller is "closer."
+/// Supported distance metrics for vector comparison
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum DistanceMetric {
+    /// Standard Euclidean distance
     Euclidean,
+    /// Cosine similarity (converted to distance as 1 - similarity)
     Cosine,
 }
 
-/// We store metadata in the single file
+/// Internal metadata structure stored in the index file
 #[derive(Serialize, Deserialize, Debug)]
 struct SingleFileMetadata {
     dim: usize,
     num_vectors: usize,
     max_degree: usize,
-
     fraction_top: f64,
     fraction_mid: f64,
-    distance_metric: DistanceMetric, // <--- store which metric
-
+    distance_metric: DistanceMetric,
     layer0_ids: Vec<u32>,
     layer1_ids: Vec<u32>,
-
     vectors_offset: u64,
     adjacency_offset: u64,
-
     offset_layer0: usize,
     offset_layer1: usize,
     offset_layer2: usize,
 }
 
-/// Main struct
+/// Main struct representing a DiskANN index
 pub struct SingleFileDiskANN {
+    /// Dimensionality of vectors in the index
     pub dim: usize,
+    /// Number of vectors in the index
     pub num_vectors: usize,
+    /// Maximum number of edges per node
     pub max_degree: usize,
-
+    /// Fraction of vectors in top layer
     pub fraction_top: f64,
+    /// Fraction of vectors in middle layer
     pub fraction_mid: f64,
+    /// Distance metric used by this index
     pub distance_metric: DistanceMetric,
 
     layer0_ids: Vec<u32>,
     layer1_ids: Vec<u32>,
-
     offset_layer0: usize,
     offset_layer1: usize,
     offset_layer2: usize,
-
     vectors_offset: u64,
     adjacency_offset: u64,
-
     mmap: Mmap,
 }
 
 impl SingleFileDiskANN {
-    /// Build a single-file index with Euclidean or Cosine distance.
+    /// Builds a new single-file index with the specified parameters
+    ///
+    /// # Arguments
+    ///
+    /// * `num_vectors` - Number of vectors to store
+    /// * `dim` - Dimensionality of the vectors
+    /// * `max_degree` - Maximum number of edges per node
+    /// * `fraction_top` - Fraction of vectors in top layer
+    /// * `fraction_mid` - Fraction of vectors in middle layer
+    /// * `distance_metric` - Distance metric to use
+    /// * `singlefile_path` - Path where the index file will be created
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<SingleFileDiskANN, DiskAnnError>`
     pub fn build_index_singlefile(
         num_vectors: usize,
         dim: usize,
@@ -100,7 +150,6 @@ impl SingleFileDiskANN {
         let vectors_offset = 1024 * 1024;
         let total_vector_bytes = (num_vectors as u64) * (dim as u64) * 4;
 
-        // 1) generate random vectors
         println!(
             "Generating {num_vectors} random vectors of dim {dim} => ~{:.2} GB on disk...",
             (num_vectors as f64 * dim as f64 * 4.0) / (1024.0 * 1024.0 * 1024.0)
@@ -129,7 +178,6 @@ impl SingleFileDiskANN {
         let gen_time = gen_start.elapsed().as_secs_f32();
         println!("Vector generation took {gen_time:.2} s");
 
-        // 2) pick subsets
         let mut all_ids: Vec<u32> = (0..num_vectors as u32).collect();
         all_ids.shuffle(&mut rng);
         let size_l0 = (num_vectors as f64 * fraction_top).ceil() as usize;
@@ -157,7 +205,6 @@ impl SingleFileDiskANN {
         let centroids =
             pick_random_centroids(cluster_count, &file, vectors_offset, dim, num_vectors)?;
 
-        // 3) parallel adjacency
         let build_start = Instant::now();
         build_layer_adjacency_parallel(
             &file,
@@ -196,7 +243,6 @@ impl SingleFileDiskANN {
         let build_time = build_start.elapsed().as_secs_f32();
         println!("Parallel adjacency build took {build_time:.2} s");
 
-        // 4) write metadata
         let metadata = SingleFileMetadata {
             dim,
             num_vectors,
@@ -239,7 +285,15 @@ impl SingleFileDiskANN {
         })
     }
 
-    /// Open an existing single-file index
+    /// Opens an existing index file
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the index file
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<SingleFileDiskANN, DiskAnnError>`
     pub fn open_index_singlefile(path: &str) -> Result<Self, DiskAnnError> {
         let file = OpenOptions::new().read(true).write(false).open(path)?;
         let mut buf8 = [0u8; 8];
@@ -269,7 +323,17 @@ impl SingleFileDiskANN {
         })
     }
 
-    /// 3-layer BFS/beam search
+    /// Searches the index for nearest neighbors
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Query vector
+    /// * `k` - Number of nearest neighbors to return
+    /// * `beam_width` - Beam width for the search
+    ///
+    /// # Returns
+    ///
+    /// Returns a vector of node IDs representing the nearest neighbors
     pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
         let _l0 = self.search_layer(query, &self.layer0_ids, self.offset_layer0, beam_width, 1);
         let _l1 = self.search_layer(query, &self.layer1_ids, self.offset_layer1, beam_width, 1);
@@ -313,7 +377,6 @@ impl SingleFileDiskANN {
             }
         }
 
-        // pick the node in layer_ids closest to the query
         let mut best_id = layer_ids[0];
         let mut best_dist = self.distance_to(query, best_id as usize);
         for &candidate_id in layer_ids.iter().skip(1) {
@@ -382,7 +445,6 @@ impl SingleFileDiskANN {
         bytemuck::cast_slice(bytes)
     }
 
-    /// distance_to calls either Euclidean or Cosine, depending on self.distance_metric.
     fn distance_to(&self, query: &[f32], idx: usize) -> f32 {
         let vector_offset = self.vectors_offset + (idx * self.dim * 4) as u64;
         let start = vector_offset as usize;
@@ -392,15 +454,11 @@ impl SingleFileDiskANN {
 
         match self.distance_metric {
             DistanceMetric::Euclidean => euclidean_distance(query, vecf),
-            DistanceMetric::Cosine => {
-                // We'll interpret "distance" = 1 - cos
-                1.0 - cosine_similarity(query, vecf)
-            }
+            DistanceMetric::Cosine => 1.0 - cosine_similarity(query, vecf),
         }
     }
 }
 
-// Parallel adjacency build
 fn build_layer_adjacency_parallel(
     file: &File,
     adjacency_offset: u64,
@@ -416,7 +474,6 @@ fn build_layer_adjacency_parallel(
         return Ok(());
     }
 
-    // 1) parallel assignment
     let node_assignments: Vec<(usize, u32)> = layer_ids
         .par_iter()
         .map(|&nid| {
@@ -437,14 +494,12 @@ fn build_layer_adjacency_parallel(
         })
         .collect();
 
-    // group them
     let cluster_count = centroids.len();
     let mut buckets = vec![Vec::new(); cluster_count];
     for (cidx, nid) in node_assignments {
         buckets[cidx].push(nid);
     }
 
-    // 2) parallel over buckets
     buckets.into_par_iter().for_each(|bucket| {
         if bucket.len() <= 1 {
             return;
@@ -522,6 +577,7 @@ fn read_vector(
     Ok(floats.to_vec())
 }
 
+/// Computes Euclidean distance between two vectors
 fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b.iter())
@@ -530,7 +586,7 @@ fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
         .sqrt()
 }
 
-/// Cosine similarity = (a·b) / (||a|| * ||b||)
+/// Computes cosine similarity between two vectors
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0;
     let mut norm_a = 0.0;
@@ -541,7 +597,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         norm_b += y * y;
     }
     if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0; // handle degenerate case
+        return 0.0;
     }
     dot / (norm_a.sqrt() * norm_b.sqrt())
 }
@@ -706,7 +762,7 @@ mod tests {
         file: &std::fs::File,
         vectors_offset: u64,
         dim: usize,
-        distance_metric: DistanceMetric,
+        _distance_metric: DistanceMetric,
     ) -> Result<Vec<(usize, Vec<f32>)>, DiskAnnError> {
         // If cluster_count=1, let's just pick the first vector
         let mut out = Vec::new();
@@ -727,7 +783,7 @@ mod tests {
         dim: usize,
         max_degree: usize,
         vectors_offset: u64,
-        centroids: &[(usize, Vec<f32>)],
+        _centroids: &[(usize, Vec<f32>)],
         distance_metric: DistanceMetric,
         // no partial sampling => entire bucket
     ) -> Result<(), DiskAnnError> {
