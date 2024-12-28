@@ -2,6 +2,9 @@
 name = "diskannrs"
 version = "0.1.0"
 edition = "2021"
+description = "A DiskANN-like Rust library with single-file storage and minimal RAM requirements"
+license = "MIT" 
+repository = "https://github.com/lukaesch/diskann-rs"
 
 [dependencies]
 rand = "0.8"
