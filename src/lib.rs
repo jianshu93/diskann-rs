@@ -15,7 +15,7 @@
 //! ## Example
 //!
 //! ```rust,no_run
-//! use diskannrs::{SingleFileDiskANN, DistanceMetric};
+//! use diskann_rs::{SingleFileDiskANN, DistanceMetric};
 //!
 //! // Build a new index
 //! let index = SingleFileDiskANN::build_index_singlefile(

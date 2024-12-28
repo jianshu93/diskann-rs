@@ -1,5 +1,5 @@
 // examples/demo.rs
-use diskannrs::{DiskAnnError, SingleFileDiskANN};
+use diskann_rs::{DiskAnnError, DistanceMetric, SingleFileDiskANN};
 use std::sync::Arc;
 
 fn main() -> Result<(), DiskAnnError> {
@@ -9,7 +9,7 @@ fn main() -> Result<(), DiskAnnError> {
     let max_degree = 32;
     let fraction_top = 0.01;
     let fraction_mid = 0.1;
-    let distance_metric = diskannrs::DistanceMetric::Cosine;
+    let distance_metric = DistanceMetric::Cosine;
 
     // Build if missing
     if !std::path::Path::new(singlefile_path).exists() {

@@ -1,6 +1,6 @@
-use diskannrs::{DiskAnnError, DistanceMetric, SingleFileDiskANN};
+use diskann_rs::{DiskAnnError, DistanceMetric, SingleFileDiskANN};
 use rand::prelude::*;
-use rayon::iter::{IntoParallelRefIterator, IndexedParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,7 +33,10 @@ fn main() -> Result<(), DiskAnnError> {
         let elapsed = start.elapsed().as_secs_f32();
         println!("Done building index in {:.2} s", elapsed);
     } else {
-        println!("Index file {} already exists, skipping build.", singlefile_path);
+        println!(
+            "Index file {} already exists, skipping build.",
+            singlefile_path
+        );
     }
 
     // open
@@ -69,4 +72,3 @@ fn main() -> Result<(), DiskAnnError> {
 
     Ok(())
 }
-
