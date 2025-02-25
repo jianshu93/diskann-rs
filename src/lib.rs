@@ -335,10 +335,27 @@ impl SingleFileDiskANN {
     ///
     /// Returns a vector of node IDs representing the nearest neighbors
     pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
+        // Use small layers as is
         let _l0 = self.search_layer(query, &self.layer0_ids, self.offset_layer0, beam_width, 1);
         let _l1 = self.search_layer(query, &self.layer1_ids, self.offset_layer1, beam_width, 1);
-        let base_ids: Vec<u32> = (0..self.num_vectors as u32).collect();
-        self.search_layer(query, &base_ids, self.offset_layer2, beam_width, k)
+
+        // Use chunks for base layer
+        const CHUNK_SIZE: usize = 100_000;
+        let mut results = Vec::with_capacity(k);
+        for chunk_start in (0..self.num_vectors).step_by(CHUNK_SIZE) {
+            let chunk_end = (chunk_start + CHUNK_SIZE).min(self.num_vectors);
+            let chunk_ids: Vec<u32> = (chunk_start..chunk_end).map(|x| x as u32).collect();
+            let chunk_results =
+                self.search_layer(query, &chunk_ids, self.offset_layer2, beam_width, k);
+            results.extend(chunk_results);
+        }
+        results.sort_by(|&a, &b| {
+            let da = self.distance_to(query, a as usize);
+            let db = self.distance_to(query, b as usize);
+            da.partial_cmp(&db).unwrap()
+        });
+        results.truncate(k);
+        results
     }
 
     fn search_layer(
@@ -368,7 +385,7 @@ impl SingleFileDiskANN {
         impl Eq for Candidate {}
         impl PartialOrd for Candidate {
             fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                other.dist.partial_cmp(&self.dist)
+                other.dist.partial_cmp(&self.dist) // Min-heap: smaller distance is "greater"
             }
         }
         impl Ord for Candidate {
@@ -377,6 +394,7 @@ impl SingleFileDiskANN {
             }
         }
 
+        // Find starting point
         let mut best_id = layer_ids[0];
         let mut best_dist = self.distance_to(query, best_id as usize);
         for &candidate_id in layer_ids.iter().skip(1) {
@@ -388,6 +406,7 @@ impl SingleFileDiskANN {
         }
         let start_id = best_id;
 
+        // Initialize
         let mut visited = vec![false; layer_ids.len()];
         let id_to_idx = layer_ids
             .iter()
@@ -395,39 +414,57 @@ impl SingleFileDiskANN {
             .map(|(i, &nid)| (nid, i))
             .collect::<std::collections::HashMap<u32, usize>>();
 
-        let start_dist = self.distance_to(query, start_id as usize);
-        let mut frontier = vec![Candidate {
-            dist: start_dist,
+        let mut current = BinaryHeap::new();
+        current.push(Candidate {
+            dist: best_dist,
             node_id: start_id,
-        }];
+        });
         if let Some(&idx) = id_to_idx.get(&start_id) {
             visited[idx] = true;
         }
 
         let mut best = BinaryHeap::new();
-        best.push(frontier[0].clone());
+        best.push(Candidate {
+            dist: best_dist,
+            node_id: start_id,
+        });
 
-        while let Some(current) = frontier.pop() {
-            let neighbors = self.get_layer_neighbors(current.node_id, layer_offset);
-            for &nbr in neighbors {
-                if nbr == 0 {
-                    continue;
-                }
-                if let Some(&nbr_idx) = id_to_idx.get(&nbr) {
-                    if !visited[nbr_idx] {
-                        visited[nbr_idx] = true;
-                        let d = self.distance_to(query, nbr as usize);
-                        let cand = Candidate {
-                            dist: d,
-                            node_id: nbr,
-                        };
-                        frontier.push(cand.clone());
-                        best.push(cand);
-                        if best.len() > beam_width {
-                            best.pop();
+        // Beam search with a maximum number of iterations
+        let max_iterations = 100; // Adjust based on experimentation
+        for _ in 0..max_iterations {
+            let mut next = BinaryHeap::new();
+            while let Some(current_cand) = current.pop() {
+                let neighbors = self.get_layer_neighbors(current_cand.node_id, layer_offset);
+                for &nbr in neighbors {
+                    if nbr == 0 {
+                        continue;
+                    }
+                    if let Some(&nbr_idx) = id_to_idx.get(&nbr) {
+                        if !visited[nbr_idx] {
+                            visited[nbr_idx] = true;
+                            let d = self.distance_to(query, nbr as usize);
+                            let cand = Candidate {
+                                dist: d,
+                                node_id: nbr,
+                            };
+                            next.push(cand.clone());
+                            best.push(cand);
+                            if best.len() > beam_width {
+                                best.pop(); // Keep top beam_width
+                            }
                         }
                     }
                 }
+            }
+            // Prepare next iteration: take top beam_width from next
+            current.clear();
+            while current.len() < beam_width && !next.is_empty() {
+                if let Some(cand) = next.pop() {
+                    current.push(cand);
+                }
+            }
+            if current.is_empty() {
+                break;
             }
         }
 
