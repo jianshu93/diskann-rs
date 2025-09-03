@@ -1,8 +1,8 @@
 [package]
 name = "diskann-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) featuring a 3-layer index architecture and parallel query processing. This project provides an efficient and scalable solution for large-scale vector similarity search with single-file storage."
+description = "A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. Provides memory-efficient vector search through graph traversal and memory-mapped storage, enabling billion-scale search with minimal RAM usage."
 license = "MIT" 
 repository = "https://github.com/lukaesch/diskann-rs"
 
