@@ -820,7 +820,7 @@ mod tests {
         let d = 32usize;
         let mut rng = rand::thread_rng();
         let vectors: Vec<Vec<f32>> = (0..n)
-            .map(|_| (0..d).map(|_| rng.gen::<f32>()).collect())
+            .map(|_| (0..d).map(|_| rng.r#gen::<f32>()).collect())
             .collect();
 
         let index =
@@ -831,7 +831,7 @@ mod tests {
                 DiskAnnParams { max_degree: 32, build_beam_width: 64, alpha: 1.2 }
             ).unwrap();
 
-        let q: Vec<f32> = (0..d).map(|_| rng.gen::<f32>()).collect();
+        let q: Vec<f32> = (0..d).map(|_| rng.r#gen::<f32>()).collect();
         let res = index.search(&q, 10, 32);
         assert_eq!(res.len(), 10);
 

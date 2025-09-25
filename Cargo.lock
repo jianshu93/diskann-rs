@@ -14,7 +14,8 @@ dependencies = [
 [[package]]
 name = "anndists"
 version = "0.1.3"
-source = "git+https://github.com/jean-pierreBoth/anndists#2a54a9a106192f239a6b615ee35f33613f9cdd07"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4bbb2296f2525e53a52680f5c2df6de9a83b8a94cc22a8cc629301a27b5e0b7"
 dependencies = [
  "anyhow",
  "cfg-if",
@@ -159,7 +160,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "diskann-rs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anndists",
  "bincode",
