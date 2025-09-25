@@ -28,42 +28,50 @@ This implementation follows the DiskANN paper's approach by:
 ### Building a New Index
 
 ```rust
-use diskann_rs::{DiskANN, DistanceMetric};
+use anndists::dist::{DistL2, DistCosine}; // or your own Distance types
+use diskann_rs::{DiskANN, DiskAnnParams};
 
-// Your vectors to index
-let vectors = vec![
-    vec![0.1, 0.2, 0.3, ...],
-    vec![0.4, 0.5, 0.6, ...],
+// Your vectors to index (all rows must share the same dimension)
+let vectors: Vec<Vec<f32>> = vec![
+    vec![0.1, 0.2, 0.3, /* ... */],
+    vec![0.4, 0.5, 0.6, /* ... */],
     // ...
 ];
 
-let index = DiskANN::build_index(
-    &vectors,
-    32,       // max neighbors per node (max_degree)
-    128,      // beam width for construction
-    1.2,      // alpha parameter for pruning
-    DistanceMetric::Euclidean,
-    "index.db"
-)?;
+// Construction parameters
+let params = DiskAnnParams {
+    dim: 128,              // vector dimension
+    max_degree: 32,        // max neighbors per node
+    build_beam_width: 128, // construction beam width
+    alpha: 1.2,            // α for pruning
+};
+
+// Choose a distance (here: L2). Use DistCosine for cosine, etc.
+let index = DiskANN::<DistL2>::build_index(&vectors, &params, "index.dann")?;
 ```
 
 ### Opening an Existing Index
 
 ```rust
-let index = DiskANN::open_index("index.db")?;
+use anndists::dist::DistL2;
+use diskann_rs::DiskANN;
+
+// The distance type must match what you used at build time
+let index = DiskANN::<DistL2>::open("index.dann")?;
 ```
 
 ### Searching the Index
 
 ```rust
-// Prepare your query vector
-let query = vec![0.1, 0.2, ...; 128];  // must match index dimension
+use diskann_rs::SearchParams;
 
-// Search for nearest neighbors
-let k = 10;           // number of neighbors to return
-let beam_width = 64;  // search beam width (higher = better recall, slower)
-let neighbors = index.search(&query, k, beam_width);
+let query: Vec<f32> = vec![0.1, 0.2, /* ... */]; // length must equal params.dim
+let k = 10;
 
+// Search parameters (tune for recall vs speed)
+let sp = SearchParams { beam_width: 64 };
+
+let neighbors: Vec<u32> = index.search(&query, k, &sp);
 // neighbors contains the IDs of the k nearest vectors
 ```
 
@@ -72,14 +80,17 @@ let neighbors = index.search(&query, k, beam_width);
 ```rust
 use rayon::prelude::*;
 use std::sync::Arc;
+use diskann_rs::SearchParams;
 
-// Create shared index reference
 let index = Arc::new(index);
+let sp = Arc::new(SearchParams { beam_width: 64 });
 
-// Perform parallel queries
+// Suppose you have a batch of queries
+let query_batch: Vec<Vec<f32>> = /* ... */;
+
 let results: Vec<Vec<u32>> = query_batch
     .par_iter()
-    .map(|query| index.search(query, k, beam_width))
+    .map(|q| index.search(q, 10, &sp))
     .collect();
 ```
 

@@ -1,45 +1,63 @@
 // examples/demo.rs
-use diskann_rs::{DiskANN, DiskAnnError, DistanceMetric};
+use anndists::dist::DistCosine; // swap to DistL2, DistDot, etc. if desired
+use diskann_rs::{DiskANN, DiskAnnError, DiskAnnParams};
 use rand::prelude::*;
 use std::sync::Arc;
 
 fn main() -> Result<(), DiskAnnError> {
     let singlefile_path = "diskann.db";
-    let num_vectors = 100_000;
-    let dim = 128;
-    let max_degree = 32;
-    let build_beam_width = 128;
-    let alpha = 1.2;
-    let distance_metric = DistanceMetric::Cosine;
+    let num_vectors = 100_000usize;
+    let dim = 128usize;
+
+    // Build-time knobs (match your DiskAnnParams)
+    let max_degree = 32usize;
+    let build_beam_width = 128usize;
+    let alpha = 1.2f32;
 
     // Build if missing
     if !std::path::Path::new(singlefile_path).exists() {
         println!("Building DiskANN index at {singlefile_path}...");
-        
-        // Generate sample vectors (in real usage, you'd load your own data)
-        println!("Generating {} sample vectors of dimension {}...", num_vectors, dim);
+
+        // Generate sample vectors (replace with your real dataset)
+        println!("Generating {num_vectors} sample vectors of dimension {dim}...");
         let mut rng = thread_rng();
-        let mut vectors = Vec::new();
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(num_vectors);
         for _ in 0..num_vectors {
-            let v: Vec<f32> = (0..dim).map(|_| rng.gen()).collect();
+            // NOTE: use r#gen() since `gen` is a reserved keyword in newer Rust editions
+            let v: Vec<f32> = (0..dim).map(|_| rng.r#gen::<f32>()).collect();
             vectors.push(v);
         }
-        
-        let index = DiskANN::build_index(
-            &vectors,
+
+        // Either: use the convenience default
+        // let _index = DiskANN::<DistCosine>::build_index_default(&vectors, DistCosine {}, singlefile_path)?;
+
+        // Or: use explicit params (shown here)
+        let params = DiskAnnParams {
             max_degree,
             build_beam_width,
             alpha,
-            distance_metric,
+        };
+        let index = DiskANN::<DistCosine>::build_index_with_params(
+            &vectors,
+            DistCosine {},
             singlefile_path,
+            params,
         )?;
-        println!("Build done. Index contains {} vectors", index.num_vectors);
+
+        println!(
+            "Build done. Index contains {} vectors (dim={}, max_degree={})",
+            index.num_vectors, index.dim, index.max_degree
+        );
     } else {
         println!("Index file {singlefile_path} already exists, skipping build.");
     }
 
-    // Open the index
-    let index = Arc::new(DiskANN::open_index(singlefile_path)?);
+    // Open the index (distance type must match what you used to build)
+    let index = Arc::new(DiskANN::<DistCosine>::open_index_with(
+        singlefile_path,
+        DistCosine {},
+    )?);
+
     println!(
         "Opened index: {} vectors, dimension={}, max_degree={}",
         index.num_vectors, index.dim, index.max_degree
@@ -47,15 +65,19 @@ fn main() -> Result<(), DiskAnnError> {
 
     // Perform a sample query
     let mut rng = thread_rng();
-    let query: Vec<f32> = (0..index.dim).map(|_| rng.gen()).collect();
-    let k = 10;
-    let search_beam_width = 64;
-    
-    println!("\nSearching for {} nearest neighbors with beam_width={}...", k, search_beam_width);
+    let query: Vec<f32> = (0..index.dim).map(|_| rng.r#gen::<f32>()).collect();
+
+    let k = 10usize;
+    let search_beam_width = 64usize;
+
+    println!(
+        "\nSearching for {k} nearest neighbors with beam_width={}...",
+        search_beam_width
+    );
     let start = std::time::Instant::now();
-    let neighbors = index.search(&query, k, search_beam_width);
+    let neighbors: Vec<u32> = index.search(&query, k, search_beam_width);
     let elapsed = start.elapsed();
-    
+
     println!("Search completed in {:?}", elapsed);
     println!("Found {} neighbors:", neighbors.len());
     for (i, &id) in neighbors.iter().enumerate() {

@@ -42,11 +42,13 @@ use anndists::prelude::Distance;
 use bytemuck;
 use memmap2::Mmap;
 use rand::prelude::*;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Mutex;
 use thiserror::Error;
 
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
@@ -205,21 +207,11 @@ where
     }
 }
 
-
 impl<D> DiskANN<D>
 where
     D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
 {
     /// Builds a new index from provided vectors
-    ///
-    /// # Arguments
-    ///
-    /// * `vectors` - The vectors to index (slice of Vec<f32>)
-    /// * `max_degree` - Maximum number of edges per node (typically 32-64)
-    /// * `build_beam_width` - Beam width during construction (e.g., 128)
-    /// * `alpha` - Pruning parameter (e.g., 1.2-2.0)
-    /// * `dist` - Any `anndists::Distance<f32>` implementation (e.g., `DistL2`)
-    /// * `file_path` - Path where the index file will be created
     pub fn build_index(
         vectors: &[Vec<f32>],
         max_degree: usize,
@@ -256,17 +248,17 @@ where
         let vectors_offset = 1024 * 1024;
         let total_vector_bytes = (num_vectors as u64) * (dim as u64) * 4;
 
-        // Write vectors contiguous
+        // Write vectors contiguous (sequential I/O is typically fastest)
         file.seek(SeekFrom::Start(vectors_offset))?;
         for vector in vectors {
             let bytes = bytemuck::cast_slice(vector);
             file.write_all(bytes)?;
         }
 
-        // Compute medoid using provided distance
+        // Compute medoid using provided distance (parallelized)
         let medoid_id = calculate_medoid(vectors, dist);
 
-        // Build Vamana-like graph
+        // Build Vamana-like graph (parallelized)
         let adjacency_offset = vectors_offset as u64 + total_vector_bytes;
         let graph = build_vamana_graph(
             vectors,
@@ -277,7 +269,7 @@ where
             medoid_id as u32,
         );
 
-        // Write adjacency lists (fixed max_degree, pad with PAD_U32)
+        // Write adjacency lists (fixed max_degree, pad with PAD_U32) - sequential I/O
         file.seek(SeekFrom::Start(adjacency_offset))?;
         for neighbors in &graph {
             let mut padded = neighbors.clone();
@@ -471,34 +463,37 @@ where
 }
 
 /// Calculates the medoid (vector closest to the centroid) using distance `D`
-fn calculate_medoid<D: Distance<f32> + Copy>(vectors: &[Vec<f32>], dist: D) -> usize {
+/// Parallelized with Rayon; `D: Send + Sync` so it can be shared across threads.
+fn calculate_medoid<D: Distance<f32> + Copy + Send + Sync>(vectors: &[Vec<f32>], dist: D) -> usize {
+    let n = vectors.len();
     let dim = vectors[0].len();
-    let mut centroid = vec![0.0f32; dim];
 
-    for v in vectors {
-        for (i, &val) in v.iter().enumerate() {
-            centroid[i] += val;
-        }
-    }
-    for val in &mut centroid {
-        *val /= vectors.len() as f32;
+    // Parallel sum across vectors → centroid
+    let mut centroid: Vec<f32> = vectors
+        .par_iter()
+        .map(|v| v.clone())
+        .reduce(|| vec![0.0f32; dim], |mut a, b| {
+            for j in 0..dim {
+                a[j] += b[j];
+            }
+            a
+        });
+    for x in &mut centroid {
+        *x /= n as f32;
     }
 
-    let mut best_idx = 0usize;
-    let mut best_dist = f32::MAX;
-
-    for (idx, v) in vectors.iter().enumerate() {
-        let d = dist.eval(&centroid, v);
-        if d < best_dist {
-            best_dist = d;
-            best_idx = idx;
-        }
-    }
-    best_idx
+    // Parallel argmin distance to centroid
+    vectors
+        .par_iter()
+        .enumerate()
+        .map(|(idx, v)| (idx, dist.eval(&centroid, v)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
 }
 
-/// Builds a simple Vamana-like graph using greedy search + α-pruning
-fn build_vamana_graph<D: Distance<f32> + Copy>(
+/// Builds a Vamana-like graph using greedy search + α-pruning (parallelized)
+fn build_vamana_graph<D: Distance<f32> + Copy + Send + Sync>(
     vectors: &[Vec<f32>],
     max_degree: usize,
     beam_width: usize,
@@ -507,70 +502,94 @@ fn build_vamana_graph<D: Distance<f32> + Copy>(
     medoid_id: u32,
 ) -> Vec<Vec<u32>> {
     let n = vectors.len();
-    let mut graph = vec![Vec::<u32>::new(); n];
 
-    // Initialize with random neighbors
-    let mut rng = thread_rng();
-    for i in 0..n {
-        let mut s = HashSet::new();
-        while s.len() < max_degree.min(n.saturating_sub(1)) {
-            let nb = rng.gen_range(0..n);
-            if nb != i {
-                s.insert(nb as u32);
+    // 1) Initialize with random neighbors (per-node parallel)
+    let mut graph: Vec<Vec<u32>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut rng = thread_rng();
+            let target = max_degree.min(n.saturating_sub(1));
+            if target == 0 {
+                return Vec::new();
             }
-        }
-        graph[i] = s.into_iter().collect();
-    }
-
-    // Improve graph with 2 passes
-    for _iter in 0..2 {
-        // Shuffle processing order
-        let mut order: Vec<usize> = (0..n).collect();
-        order.shuffle(&mut rng);
-
-        for &u in &order {
-            // Greedy search from medoid to gather candidates
-            let cands =
-                greedy_search(&vectors[u], vectors, &graph, medoid_id as usize, beam_width, dist);
-
-            // α-prune
-            let pruned = prune_neighbors(u, &cands, vectors, max_degree, alpha, dist);
-            graph[u] = pruned.clone();
-
-            // make undirected (with pruning if overflow)
-            for nb in pruned {
-                let adj = &mut graph[nb as usize];
-                if !adj.contains(&(u as u32)) {
-                    adj.push(u as u32);
-                    if adj.len() > max_degree {
-                        // prune neighbor's list as well
-                        let candidates_of_nb: Vec<(u32, f32)> = adj
-                            .iter()
-                            .map(|&id| {
-                                (
-                                    id,
-                                    dist.eval(&vectors[nb as usize], &vectors[id as usize]),
-                                )
-                            })
-                            .collect();
-                        *adj = prune_neighbors(
-                            nb as usize,
-                            &candidates_of_nb,
-                            vectors,
-                            max_degree,
-                            alpha,
-                            dist,
-                        );
-                    }
+            let mut s = HashSet::with_capacity(target);
+            while s.len() < target {
+                let nb = rng.gen_range(0..n);
+                if nb != i {
+                    s.insert(nb as u32);
                 }
             }
-        }
+            s.into_iter().collect()
+        })
+        .collect();
+
+    // 2) Improve graph with a few parallel passes
+    let passes = 2usize;
+    for _ in 0..passes {
+        // 2a) Per-node parallel refinement: greedy search → α-prune (read-only view of `graph`)
+        let next_graph: Vec<Vec<u32>> = (0..n)
+            .into_par_iter()
+            .map(|u| {
+                let cands = greedy_search(
+                    &vectors[u],
+                    vectors,
+                    &graph,
+                    medoid_id as usize,
+                    beam_width,
+                    dist,
+                );
+                prune_neighbors(u, &cands, vectors, max_degree, alpha, dist)
+            })
+            .collect();
+
+        // 2b) Enforce symmetry using a mutex-protected accumulator (parallel)
+        let sym_lists: Vec<Mutex<Vec<u32>>> = (0..n).map(|_| Mutex::new(Vec::new())).collect();
+
+        // Seed with current (u -> nb)
+        (0..n).into_par_iter().for_each(|u| {
+            let mut guard = sym_lists[u].lock().unwrap();
+            guard.extend_from_slice(&next_graph[u]);
+        });
+
+        // Add back-edges (nb -> u)
+        (0..n).into_par_iter().for_each(|u| {
+            for &nb in &next_graph[u] {
+                let mut g = sym_lists[nb as usize].lock().unwrap();
+                g.push(u as u32);
+            }
+        });
+
+        // Collect and dedup
+        let sym_graph: Vec<Vec<u32>> = sym_lists
+            .into_iter()
+            .map(|m| {
+                let mut v = m.into_inner().unwrap();
+                v.sort_unstable();
+                v.dedup();
+                v
+            })
+            .collect();
+
+        // 2c) Final per-node prune to cap degree and maintain diversity (parallel)
+        graph = (0..n)
+            .into_par_iter()
+            .map(|u| {
+                if sym_graph[u].is_empty() {
+                    return Vec::new();
+                }
+                let candidates: Vec<(u32, f32)> = sym_graph[u]
+                    .iter()
+                    .map(|&id| (id, dist.eval(&vectors[u], &vectors[id as usize])))
+                    .collect();
+                prune_neighbors(u, &candidates, vectors, max_degree, alpha, dist)
+            })
+            .collect();
     }
 
     graph
 }
 
-/// Greedy search used during construction
+/// Greedy search used during construction (per-node, sequential)
 fn greedy_search<D: Distance<f32> + Copy>(
     query: &[f32],
     vectors: &[Vec<f32>],
@@ -623,7 +642,7 @@ fn greedy_search<D: Distance<f32> + Copy>(
     w.into_vec().into_iter().map(|c| (c.id, c.dist)).collect()
 }
 
-/// α-pruning from DiskANN/Vamana
+/// α-pruning from DiskANN/Vamana (sequential per node)
 fn prune_neighbors<D: Distance<f32> + Copy>(
     node_id: usize,
     candidates: &[(u32, f32)],
