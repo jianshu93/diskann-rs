@@ -20,7 +20,7 @@ fn euclid(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn main() -> Result<(), DiskAnnError> {
-    // Load ANN benchmark data (Fashion-MNIST, L2, HDF5)
+    // Load ANN benchmark data (Fashion-MNIST, L2, HDF5), must be in crate root
     // wget http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5
     let fname = String::from("./fashion-mnist-784-euclidean.hdf5");
     println!("\n\nDiskANN benchmark on {:?}", fname);
