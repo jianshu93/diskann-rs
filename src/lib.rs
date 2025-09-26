@@ -1,11 +1,10 @@
 //! # DiskAnnRS (generic over `anndists::Distance<f32>`)
 //!
-//! A minimal, in-memory DiskANN-like library that:
+//! A minimal, on-disk, DiskANN-like library that:
 //! - Builds a Vamana-style graph (greedy + α-pruning) in memory
 //! - Writes vectors + fixed-degree adjacency to a single file
 //! - Memory-maps the file for low-overhead reads
-//! - Is **generic over any Distance<f32>** from `anndists` (L2, Cosine, Dot, …)
-//!
+//! - Is **generic over any Distance<f32>** from `anndists` (L2, Cosine, Hamming, Dot, …)
 //!
 //! ## Example
 //! ```no_run
@@ -29,10 +28,10 @@
 //! let neighbors = index.search(&query, 10, 64);
 //!
 //! // Open later (provide the same distance type)
-//! let reopened = DiskANN::<DistL2>::open_index_default_metric("index.db").unwrap();
+//! let _reopened = DiskANN::<DistL2>::open_index_default_metric("index.db").unwrap();
 //! ```
 //!
-//! ## File Layout (simple, in-memory oriented)
+//! ## File Layout
 //! [ metadata_len:u64 ][ metadata (bincode) ][ padding up to vectors_offset ]
 //! [ vectors (num * dim * f32) ][ adjacency (num * max_degree * u32) ]
 //!
@@ -44,19 +43,18 @@ use memmap2::Mmap;
 use rand::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::Mutex;
 use thiserror::Error;
 
 /// Padding sentinel for adjacency slots (avoid colliding with node 0).
 const PAD_U32: u32 = u32::MAX;
 
-/// Sane defaults for in-memory DiskANN builds.
+/// Defaults for in-memory DiskANN builds
 pub const DISKANN_DEFAULT_MAX_DEGREE: usize = 32;
-pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 128;
+pub const DISKANN_DEFAULT_BUILD_BEAM: usize = 256;
 pub const DISKANN_DEFAULT_ALPHA: f32 = 1.2;
 
 /// Optional bag of knobs if you want to override just a few.
@@ -104,8 +102,8 @@ struct Metadata {
     distance_name: String,
 }
 
-/// Candidate struct for search operations
-#[derive(Clone)]
+/// Candidate for search/frontier queues
+#[derive(Clone, Copy)]
 struct Candidate {
     dist: f32,
     id: u32,
@@ -118,8 +116,8 @@ impl PartialEq for Candidate {
 impl Eq for Candidate {}
 impl PartialOrd for Candidate {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // Make BinaryHeap a min-heap on distance by reversing comparison.
-        other.dist.partial_cmp(&self.dist)
+        // Natural order by distance: smaller is "less".
+        self.dist.partial_cmp(&other.dist)
     }
 }
 impl Ord for Candidate {
@@ -144,7 +142,7 @@ where
 
     /// ID of the medoid (used as entry point)
     medoid_id: u32,
-    // Legacy offsets kept for clarity
+    // Offsets
     vectors_offset: u64,
     adjacency_offset: u64,
 
@@ -161,7 +159,7 @@ impl<D> DiskANN<D>
 where
     D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
 {
-    /// Build with default parameters: (M=32, beam=128, alpha=1.2).
+    /// Build with default parameters: (M=32, L=256, alpha=1.2).
     pub fn build_index_default(
         vectors: &[Vec<f32>],
         dist: D,
@@ -212,6 +210,14 @@ where
     D: Distance<f32> + Send + Sync + Copy + Clone + 'static,
 {
     /// Builds a new index from provided vectors
+    ///
+    /// # Arguments
+    /// * `vectors` - The vectors to index (slice of Vec<f32>)
+    /// * `max_degree` - Maximum edges per node (M ~ 24-64)
+    /// * `build_beam_width` - Construction L (e.g., 128-400)
+    /// * `alpha` - Pruning parameter (1.2–2.0)
+    /// * `dist` - Any `anndists::Distance<f32>` (e.g., `DistL2`)
+    /// * `file_path` - Path of index file
     pub fn build_index(
         vectors: &[Vec<f32>],
         max_degree: usize,
@@ -248,17 +254,17 @@ where
         let vectors_offset = 1024 * 1024;
         let total_vector_bytes = (num_vectors as u64) * (dim as u64) * 4;
 
-        // Write vectors contiguous (sequential I/O is typically fastest)
+        // Write vectors contiguous (sequential I/O is fastest)
         file.seek(SeekFrom::Start(vectors_offset))?;
         for vector in vectors {
             let bytes = bytemuck::cast_slice(vector);
             file.write_all(bytes)?;
         }
 
-        // Compute medoid using provided distance (parallelized)
+        // Compute medoid using provided distance (parallelized distance eval)
         let medoid_id = calculate_medoid(vectors, dist);
 
-        // Build Vamana-like graph (parallelized)
+        // Build Vamana-like graph (stronger refinement, parallel inner loops)
         let adjacency_offset = vectors_offset as u64 + total_vector_bytes;
         let graph = build_vamana_graph(
             vectors,
@@ -269,7 +275,7 @@ where
             medoid_id as u32,
         );
 
-        // Write adjacency lists (fixed max_degree, pad with PAD_U32) - sequential I/O
+        // Write adjacency lists (fixed max_degree, pad with PAD_U32)
         file.seek(SeekFrom::Start(adjacency_offset))?;
         for neighbors in &graph {
             let mut padded = neighbors.clone();
@@ -351,7 +357,8 @@ where
         })
     }
 
-    /// Searches the index for nearest neighbors using a simple beam search
+    /// Searches the index for nearest neighbors using a best-first beam search.
+    /// Termination rule: continue while the best frontier can still improve the worst in working set.
     pub fn search(&self, query: &[f32], k: usize, beam_width: usize) -> Vec<u32> {
         assert_eq!(
             query.len(),
@@ -362,38 +369,31 @@ where
         );
 
         let mut visited = HashSet::new();
-        let mut candidates = BinaryHeap::new(); // frontier
-        let mut w = BinaryHeap::new(); // working set
+        let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // min-heap by dist
+        let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // max-heap by dist (peek = worst)
 
-        // Start from medoid
+        // Seed from medoid
         let start_dist = self.distance_to(query, self.medoid_id as usize);
         let start = Candidate {
             dist: start_dist,
             id: self.medoid_id,
         };
-        candidates.push(start.clone());
+        frontier.push(Reverse(start));
         w.push(start);
         visited.insert(self.medoid_id);
 
-        // Beam search with a mild early-stop heuristic
-        let mut best_dist = start_dist;
-        let mut iterations_without_improvement = 0usize;
-        const MAX_NO_IMPROVE: usize = 5;
-
-        while let Some(current) = candidates.pop() {
-            if current.dist > best_dist {
-                iterations_without_improvement += 1;
-                if iterations_without_improvement > MAX_NO_IMPROVE {
-                    break;
+        // Expand while there's potential improvement
+        while let Some(Reverse(best)) = frontier.peek().copied() {
+            if w.len() >= beam_width {
+                if let Some(worst) = w.peek() {
+                    if best.dist >= worst.dist {
+                        break;
+                    }
                 }
-            } else {
-                best_dist = current.dist;
-                iterations_without_improvement = 0;
             }
+            let Reverse(current) = frontier.pop().unwrap();
 
-            let neighbors = self.get_neighbors(current.id).to_owned();
-
-            for &neighbor_id in neighbors.iter() {
+            for &neighbor_id in self.get_neighbors(current.id) {
                 if neighbor_id == PAD_U32 {
                     continue;
                 }
@@ -402,25 +402,15 @@ where
                 }
 
                 let d = self.distance_to(query, neighbor_id as usize);
-                w.push(Candidate { dist: d, id: neighbor_id });
+                let cand = Candidate { dist: d, id: neighbor_id };
 
-                // Cap working set to beam_width (keep best `beam_width`)
-                if w.len() > beam_width {
-                    let mut temp = Vec::with_capacity(beam_width);
-                    for _ in 0..beam_width {
-                        if let Some(c) = w.pop() {
-                            temp.push(c);
-                        }
-                    }
-                    w.clear();
-                    for c in temp {
-                        w.push(c);
-                    }
-                }
-
-                // Add to frontier if promising
-                if w.len() < beam_width || d < w.peek().unwrap().dist {
-                    candidates.push(Candidate { dist: d, id: neighbor_id });
+                if w.len() < beam_width {
+                    w.push(cand);
+                    frontier.push(Reverse(cand));
+                } else if d < w.peek().unwrap().dist {
+                    w.pop();
+                    w.push(cand);
+                    frontier.push(Reverse(cand));
                 }
             }
         }
@@ -463,133 +453,179 @@ where
 }
 
 /// Calculates the medoid (vector closest to the centroid) using distance `D`
-/// Parallelized with Rayon; `D: Send + Sync` so it can be shared across threads.
-fn calculate_medoid<D: Distance<f32> + Copy + Send + Sync>(vectors: &[Vec<f32>], dist: D) -> usize {
-    let n = vectors.len();
+/// Parallelizes the per-vector distance evaluations.
+fn calculate_medoid<D: Distance<f32> + Copy + Sync>(vectors: &[Vec<f32>], dist: D) -> usize {
     let dim = vectors[0].len();
+    let mut centroid = vec![0.0f32; dim];
 
-    // Parallel sum across vectors → centroid
-    let mut centroid: Vec<f32> = vectors
-        .par_iter()
-        .map(|v| v.clone())
-        .reduce(|| vec![0.0f32; dim], |mut a, b| {
-            for j in 0..dim {
-                a[j] += b[j];
-            }
-            a
-        });
-    for x in &mut centroid {
-        *x /= n as f32;
+    for v in vectors {
+        for (i, &val) in v.iter().enumerate() {
+            centroid[i] += val;
+        }
+    }
+    for val in &mut centroid {
+        *val /= vectors.len() as f32;
     }
 
-    // Parallel argmin distance to centroid
-    vectors
+    let (best_idx, _best_dist) = vectors
         .par_iter()
         .enumerate()
         .map(|(idx, v)| (idx, dist.eval(&centroid, v)))
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-        .map(|(idx, _)| idx)
-        .unwrap_or(0)
+        .reduce(
+            || (0usize, f32::MAX),
+            |a, b| if a.1 <= b.1 { a } else { b },
+        );
+
+    best_idx
 }
 
-/// Builds a Vamana-like graph using greedy search + α-pruning (parallelized)
-fn build_vamana_graph<D: Distance<f32> + Copy + Send + Sync>(
+/// Builds a strengthened Vamana-like graph using multi-pass refinement.
+/// - Multi-seed candidate gathering (medoid + random seeds)
+/// - Union with current adjacency before α-prune
+/// - 6 refinement passes with symmetrization after each pass
+fn build_vamana_graph<D: Distance<f32> + Copy + Sync>(
     vectors: &[Vec<f32>],
     max_degree: usize,
-    beam_width: usize,
+    build_beam_width: usize,
     alpha: f32,
     dist: D,
     medoid_id: u32,
 ) -> Vec<Vec<u32>> {
     let n = vectors.len();
+    let mut graph = vec![Vec::<u32>::new(); n];
 
-    // 1) Initialize with random neighbors (per-node parallel)
-    let mut graph: Vec<Vec<u32>> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut rng = thread_rng();
-            let target = max_degree.min(n.saturating_sub(1));
-            if target == 0 {
-                return Vec::new();
-            }
-            let mut s = HashSet::with_capacity(target);
+    // Light random bootstrap to avoid disconnected starts
+    {
+        let mut rng = thread_rng();
+        for i in 0..n {
+            let mut s = HashSet::new();
+            let target = (max_degree / 2).max(2).min(n.saturating_sub(1));
             while s.len() < target {
                 let nb = rng.gen_range(0..n);
                 if nb != i {
                     s.insert(nb as u32);
                 }
             }
-            s.into_iter().collect()
-        })
-        .collect();
+            graph[i] = s.into_iter().collect();
+        }
+    }
 
-    // 2) Improve graph with a few parallel passes
-    let passes = 2usize;
-    for _ in 0..passes {
-        // 2a) Per-node parallel refinement: greedy search → α-prune (read-only view of `graph`)
-        let next_graph: Vec<Vec<u32>> = (0..n)
-            .into_par_iter()
-            .map(|u| {
-                let cands = greedy_search(
-                    &vectors[u],
-                    vectors,
-                    &graph,
-                    medoid_id as usize,
-                    beam_width,
-                    dist,
-                );
-                prune_neighbors(u, &cands, vectors, max_degree, alpha, dist)
+    // Refinement passes
+    const PASSES: usize = 6;
+    const EXTRA_SEEDS: usize = 4;
+
+    let mut rng = thread_rng();
+    for _pass in 0..PASSES {
+        // Shuffle visit order each pass
+        let mut order: Vec<usize> = (0..n).collect();
+        order.shuffle(&mut rng);
+
+        // Snapshot read of graph for parallel candidate building
+        let snapshot = &graph;
+
+        // Build new neighbor proposals in parallel
+        let new_graph: Vec<Vec<u32>> = order
+            .par_iter()
+            .map(|&u| {
+                let mut candidates: Vec<(u32, f32)> =
+                    Vec::with_capacity(build_beam_width * (2 + EXTRA_SEEDS));
+
+                // Include current adjacency with distances
+                for &nb in &snapshot[u] {
+                    let d = dist.eval(&vectors[u], &vectors[nb as usize]);
+                    candidates.push((nb, d));
+                }
+
+                // Seeds: always medoid + some random starts
+                let mut seeds = Vec::with_capacity(1 + EXTRA_SEEDS);
+                seeds.push(medoid_id as usize);
+                let mut trng = thread_rng();
+                for _ in 0..EXTRA_SEEDS {
+                    seeds.push(trng.gen_range(0..n));
+                }
+
+                // Gather candidates from greedy searches
+                for start in seeds {
+                    let mut part = greedy_search(
+                        &vectors[u],
+                        vectors,
+                        snapshot,
+                        start,
+                        build_beam_width,
+                        dist,
+                    );
+                    candidates.append(&mut part);
+                }
+
+                // Deduplicate by id keeping best distance
+                candidates.sort_by(|a, b| a.0.cmp(&b.0));
+                candidates.dedup_by(|a, b| {
+                    if a.0 == b.0 {
+                        if a.1 < b.1 {
+                            *b = *a;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                // α-prune around u
+                prune_neighbors(u, &candidates, vectors, max_degree, alpha, dist)
             })
             .collect();
 
-        // 2b) Enforce symmetry using a mutex-protected accumulator (parallel)
-        let sym_lists: Vec<Mutex<Vec<u32>>> = (0..n).map(|_| Mutex::new(Vec::new())).collect();
-
-        // Seed with current (u -> nb)
-        (0..n).into_par_iter().for_each(|u| {
-            let mut guard = sym_lists[u].lock().unwrap();
-            guard.extend_from_slice(&next_graph[u]);
-        });
-
-        // Add back-edges (nb -> u)
-        (0..n).into_par_iter().for_each(|u| {
-            for &nb in &next_graph[u] {
-                let mut g = sym_lists[nb as usize].lock().unwrap();
-                g.push(u as u32);
+        // Symmetrize: union incoming + outgoing, then α-prune again (parallel)
+        // Build incoming lists
+        let mut incoming: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for (u_pos, &u) in order.iter().enumerate() {
+            for &v in &new_graph[u_pos] {
+                incoming[v as usize].push(u as u32);
             }
-        });
+        }
 
-        // Collect and dedup
-        let sym_graph: Vec<Vec<u32>> = sym_lists
-            .into_iter()
-            .map(|m| {
-                let mut v = m.into_inner().unwrap();
-                v.sort_unstable();
-                v.dedup();
-                v
-            })
-            .collect();
-
-        // 2c) Final per-node prune to cap degree and maintain diversity (parallel)
+        // Union + prune in parallel back to graph
         graph = (0..n)
             .into_par_iter()
             .map(|u| {
-                if sym_graph[u].is_empty() {
-                    return Vec::new();
+                let mut set = HashSet::new();
+                for &x in &new_graph[order.iter().position(|&x| x == u).unwrap()] {
+                    set.insert(x);
                 }
-                let candidates: Vec<(u32, f32)> = sym_graph[u]
-                    .iter()
-                    .map(|&id| (id, dist.eval(&vectors[u], &vectors[id as usize])))
+                for &x in &incoming[u] {
+                    set.insert(x);
+                }
+                // Compute distances and prune
+                let pool: Vec<(u32, f32)> = set
+                    .into_iter()
+                    .filter(|&id| id as usize != u)
+                    .map(|id| (id, dist.eval(&vectors[u], &vectors[id as usize])))
                     .collect();
-                prune_neighbors(u, &candidates, vectors, max_degree, alpha, dist)
+
+                prune_neighbors(u, &pool, vectors, max_degree, alpha, dist)
             })
             .collect();
     }
 
+    // Final cleanup (ensure <= max_degree everywhere)
     graph
+        .into_par_iter()
+        .enumerate()
+        .map(|(u, neigh)| {
+            if neigh.len() <= max_degree {
+                return neigh;
+            }
+            let pool: Vec<(u32, f32)> = neigh
+                .iter()
+                .map(|&id| (id, dist.eval(&vectors[u], &vectors[id as usize])))
+                .collect();
+            prune_neighbors(u, &pool, vectors, max_degree, alpha, dist)
+        })
+        .collect()
 }
 
-/// Greedy search used during construction (per-node, sequential)
+/// Greedy search used during construction (read-only on `graph`)
+/// Same termination rule as query-time search.
 fn greedy_search<D: Distance<f32> + Copy>(
     query: &[f32],
     vectors: &[Vec<f32>],
@@ -599,50 +635,52 @@ fn greedy_search<D: Distance<f32> + Copy>(
     dist: D,
 ) -> Vec<(u32, f32)> {
     let mut visited = HashSet::new();
-    let mut frontier = BinaryHeap::new();
-    let mut w = BinaryHeap::new();
+    let mut frontier: BinaryHeap<Reverse<Candidate>> = BinaryHeap::new(); // min-heap by dist
+    let mut w: BinaryHeap<Candidate> = BinaryHeap::new(); // max-heap by dist
 
     let start_dist = dist.eval(query, &vectors[start_id]);
     let start = Candidate {
         dist: start_dist,
         id: start_id as u32,
     };
-    frontier.push(start.clone());
+    frontier.push(Reverse(start));
     w.push(start);
     visited.insert(start_id as u32);
 
-    while let Some(cur) = frontier.pop() {
+    while let Some(Reverse(best)) = frontier.peek().copied() {
+        if w.len() >= beam_width {
+            if let Some(worst) = w.peek() {
+                if best.dist >= worst.dist {
+                    break;
+                }
+            }
+        }
+        let Reverse(cur) = frontier.pop().unwrap();
+
         for &nb in &graph[cur.id as usize] {
-            if visited.contains(&nb) {
+            if !visited.insert(nb) {
                 continue;
             }
-            visited.insert(nb);
             let d = dist.eval(query, &vectors[nb as usize]);
-            w.push(Candidate { dist: d, id: nb });
+            let cand = Candidate { dist: d, id: nb };
 
-            if w.len() > beam_width {
-                let mut tmp = Vec::with_capacity(beam_width);
-                for _ in 0..beam_width {
-                    if let Some(c) = w.pop() {
-                        tmp.push(c);
-                    }
-                }
-                w.clear();
-                for c in tmp {
-                    w.push(c);
-                }
-            }
-
-            if w.len() < beam_width || d < w.peek().unwrap().dist {
-                frontier.push(Candidate { dist: d, id: nb });
+            if w.len() < beam_width {
+                w.push(cand);
+                frontier.push(Reverse(cand));
+            } else if d < w.peek().unwrap().dist {
+                w.pop();
+                w.push(cand);
+                frontier.push(Reverse(cand));
             }
         }
     }
 
-    w.into_vec().into_iter().map(|c| (c.id, c.dist)).collect()
+    let mut v = w.into_vec();
+    v.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+    v.into_iter().map(|c| (c.id, c.dist)).collect()
 }
 
-/// α-pruning from DiskANN/Vamana (sequential per node)
+/// α-pruning from DiskANN/Vamana
 fn prune_neighbors<D: Distance<f32> + Copy>(
     node_id: usize,
     candidates: &[(u32, f32)],
@@ -811,7 +849,7 @@ mod tests {
                 &vectors,
                 DistL2 {},
                 path,
-                DiskAnnParams { max_degree: 4, build_beam_width: 16, alpha: 1.5 }
+                DiskAnnParams { max_degree: 4, build_beam_width: 64, alpha: 1.5 }
             ).unwrap();
 
         for target in 0..vectors.len() {
@@ -847,11 +885,11 @@ mod tests {
                 &vectors,
                 DistL2 {},
                 path,
-                DiskAnnParams { max_degree: 32, build_beam_width: 64, alpha: 1.2 }
+                DiskAnnParams { max_degree: 32, build_beam_width: 128, alpha: 1.2 }
             ).unwrap();
 
         let q: Vec<f32> = (0..d).map(|_| rng.r#gen::<f32>()).collect();
-        let res = index.search(&q, 10, 32);
+        let res = index.search(&q, 10, 64);
         assert_eq!(res.len(), 10);
 
         // Ensure distances are nondecreasing
