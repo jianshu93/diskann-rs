@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 fn main() -> Result<(), DiskAnnError> {
     let singlefile_path = "diskann.db";
-    let num_vectors = 100_000usize;
-    let dim = 128usize;
+    let num_vectors = 1_000_000usize;
+    let dim = 1024usize;
 
     // Build-time knobs (match your DiskAnnParams)
     let max_degree = 32usize;
