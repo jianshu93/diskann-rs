@@ -104,13 +104,14 @@ fn run_search(
 }
 
 fn main() -> Result<(), DiskAnnError> {
-    // SIFT1M (L2) HDF5 path, must be in crate root
-    // wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
+    // SIFT1M (L2) HDF5 path
     let fname = String::from("./sift-128-euclidean.hdf5");
     println!("\n\nDiskANN benchmark on {:?}", fname);
 
-    let anndata =
+    // Make this mutable so we can clear fields to free memory.
+    let mut anndata =
         annhdf5::AnnBenchmarkData::new(fname.clone()).expect("Failed to load SIFT1M HDF5 file");
+
     let knbn_max = anndata.test_distances.dim().1;
     let nb_elem = anndata.train_data.len();
     let nb_search = anndata.test_data.len();
@@ -119,29 +120,28 @@ fn main() -> Result<(), DiskAnnError> {
     println!("Test size  : {}", nb_search);
     println!("Ground-truth k per query in file: {}", knbn_max);
 
-    // DiskANN build parameters
+    // Build/open parameters
     let max_degree = 64;
-    let build_beam_width = 256; // L during construction; 320–640 are common for high recall
-    let alpha = 1.2;            // standard α
+    let build_beam_width = 256;
+    let alpha = 1.2;
 
-    // Extract raw vectors (ids are implicit 0..n-1)
-    let train_vectors: Vec<Vec<f32>> = anndata
-        .train_data
-        .iter()
-        .map(|pair| pair.0.clone())
-        .collect();
-
-    // Build or open index
     let index_path = "diskann_sift1m.db";
     let index = if !std::path::Path::new(index_path).exists() {
         println!(
             "\nBuilding DiskANN index: n={}, dim={}, max_degree={}, build_beam={}, alpha={}",
-            train_vectors.len(),
-            train_vectors[0].len(),
+            nb_elem,
+            anndata.train_data[0].0.len(),
             max_degree,
             build_beam_width,
             alpha
         );
+
+        // Clone the training matrix ONLY when we actually need to build.
+        let train_vectors: Vec<Vec<f32>> = anndata
+            .train_data
+            .iter()
+            .map(|pair| pair.0.clone())
+            .collect();
 
         let params = DiskAnnParams {
             max_degree,
@@ -162,6 +162,13 @@ fn main() -> Result<(), DiskAnnError> {
             cpu_time, wall_time
         );
 
+        // FREE HERE #1: we no longer need the cloned training matrix
+        drop(train_vectors);
+
+        // FREE HERE #2: we also no longer need the loader’s train_data
+        anndata.train_data.clear();
+        anndata.train_data.shrink_to_fit(); // may or may not return to OS immediately
+
         idx
     } else {
         println!("\nIndex file {} exists, opening…", index_path);
@@ -172,14 +179,29 @@ fn main() -> Result<(), DiskAnnError> {
             "Opened index: {} vectors, dim={}, metric={} in {:?}",
             idx.num_vectors, idx.dim, idx.distance_name, wall_time
         );
+
+        // FREE HERE #3: when not building, you never need train_data at all
+        anndata.train_data.clear();
+        anndata.train_data.shrink_to_fit();
+
         idx
     };
 
+    // OPTIONAL BIG WIN:
+    // If you want to free *everything* from anndata except what's needed for recall:
+    // let test_data = std::mem::take(&mut anndata.test_data);           // moves Vec out
+    // let test_distances = anndata.test_distances.clone();              // keep GT (or take if movable)
+    // let fname_label = anndata.fname.clone();
+    // drop(anndata);                                                    // FREE HERE #4: drop the whole loader
+    // Then change run_search signature to accept (&test_data, &test_distances, &fname_label).
+
     let index = Arc::new(index);
 
-    // Evaluate at k=10, beam 64 and 128
+    // If per-thread scratch is heavy, limit threads (helps RSS):
+    // std::env::set_var("RAYON_NUM_THREADS", "8");
+
+    // Evaluate at k=10, beam 256
     let k = 10.min(knbn_max);
-    run_search(&index, &anndata, k, 384);
     run_search(&index, &anndata, k, 512);
 
     Ok(())
