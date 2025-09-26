@@ -1,8 +1,10 @@
 # DiskANN Implementation in Rust
 
-[![Rust](https://github.com/lukaesch/diskann-rs/actions/workflows/rust.yml/badge.svg?branch=main)](https://github.com/lukaesch/diskann-rs/actions/workflows/rust.yml)
+[![Latest Version](https://img.shields.io/crates/v/diskann_rs?style=for-the-badge&color=mediumpurple&logo=rust)](https://crates.io/crates/diskann_rs)
+[![docs.rs](https://img.shields.io/docsrs/diskann_rs?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/diskann_rs/latest/diskann_rs/)
 
-A Rust implementation of DiskANN (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. This project provides an efficient and scalable solution for large-scale vector similarity search with minimal memory footprint.
+
+A Rust implementation of [DiskANN]() (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. This project provides an efficient and scalable solution for large-scale vector similarity search with minimal memory footprint, as an alternative to the widely used in-memory [HNSW](https://crates.io/crates/hnsw_rs) algorithm.
 
 ## Overview
 
@@ -10,15 +12,15 @@ This implementation follows the DiskANN paper's approach by:
 - Using the Vamana graph algorithm for index construction
 - Memory-mapping the index file for efficient disk-based access
 - Implementing beam search with medoid entry points
-- Supporting both Euclidean distance and Cosine similarity
+- Supporting Euclidean, Cosine, Hamming and other distance metrics via a generic distance trait
 - Maintaining minimal memory footprint during search operations
 
 ## Key Features
 
 - **Single-file storage**: All index data stored in one memory-mapped file
-- **Vamana graph construction**: Efficient graph building with α-pruning
+- **Vamana graph construction**: Efficient graph building with α-pruning, with rayon for concurrent and parallel construction
 - **Memory-efficient search**: Uses beam search that visits < 1% of vectors
-- **Distance metrics**: Support for both Euclidean and Cosine similarity
+- **Distance metrics**: Support for Euclidean, Cosine and Hamming similarity et.al. via [anndists](https://crates.io/crates/anndists). A generic distance trait that can be extended to other distance metrics
 - **Medoid-based entry points**: Smart starting points for search
 - **Parallel query processing**: Using rayon for concurrent searches
 - **Minimal memory footprint**: ~330MB RAM for 2GB index (16% of file size)
@@ -131,7 +133,7 @@ let results: Vec<Vec<u32>> = query_batch
 - `alpha`: 1.2-2.0 (higher = more diverse neighbors)
 
 ### Search Parameters
-- `beam_width`: 32-128 (trade-off between speed and recall)
+- `beam_width`: 128 or larger (trade-off between speed and recall)
 - Higher beam_width = better recall but slower search
 
 ## Building and Testing
@@ -145,9 +147,16 @@ cargo test
 
 # Run demo
 cargo run --release --example demo
-
 # Run performance test
 cargo run --release --example perf_test
+
+# test MNIST fashion dataset
+wget http://ann-benchmarks.com/fashion-mnist-784-euclidean.hdf5
+cargo run --release --example diskann_mnist
+
+# test SIFT dataset
+wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
+cargo run --release --example diskann_sift
 ```
 
 ## Examples
@@ -155,6 +164,45 @@ cargo run --release --example perf_test
 See the `examples/` directory for:
 - `demo.rs`: Demo with 100k vectors  
 - `perf_test.rs`: Performance benchmarking with 1M vectors
+- `diskann_mnist.rs`: Performance benchmarking with MNIST fashion dataset
+- `diskann_sift.rs`: Performance benchmarking with SIFT 1M dataset
+
+## Benchmark against HNSW ([hnsw_rs](https://crates.io/crates/hnsw_rs) crate)
+```bash
+### MNIST fashion, diskann, M4 Max
+Building DiskANN index: n=60000, dim=784, max_degree=48, build_beam=256, alpha=1.2
+Build complete. CPU time: 1726.199372s, wall time: 111.145414s
+Searching 10000 queries with k=10, beam_width=384 …
+ mean fraction nb returned by search 1.0
+
+ last distances ratio 1.0031366
+ recall rate for "./fashion-mnist-784-euclidean.hdf5" is 0.98838 , nb req /s 18067.664
+
+ total cpu time for search requests 8.520862s , system time 553.475ms
+
+
+### MNIST fashion, hnsw_rs, M4 Max
+parallel insertion
+
+ hnsw data insertion cpu time  111.169283s  system time Ok(7.256291s) 
+ debug dump of PointIndexation
+ layer 0 : length : 59999 
+ layer 1 : length : 1 
+ debug dump of PointIndexation end
+ hnsw data nb point inserted 60000
+
+ searching with ef : 24
+ 
+ parallel search
+total cpu time for search requests 3838731.0 , system time 263571.0 
+
+ mean fraction nb returned by search 1.0 
+
+ last distances ratio 1.0003573 
+
+ recall rate for "./fashion-mnist-784-euclidean.hdf5" is 0.99054 , nb req /s 37940.44
+
+```
 
 ## Current Implementation
 
