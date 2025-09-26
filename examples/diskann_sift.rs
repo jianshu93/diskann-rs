@@ -105,6 +105,7 @@ fn run_search(
 
 fn main() -> Result<(), DiskAnnError> {
     // SIFT1M (L2) HDF5 path
+    // wget http://ann-benchmarks.com/sift-128-euclidean.hdf5
     let fname = String::from("./sift-128-euclidean.hdf5");
     println!("\n\nDiskANN benchmark on {:?}", fname);
 
