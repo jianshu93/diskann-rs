@@ -254,6 +254,7 @@ fn eval_recall(
 
 fn main() {
     // Filenames in repo root
+    // download all data here: http://corpus-texmex.irisa.fr (ANN_SIFT1B)
     let base_path = "bigann_base.bvecs";
     let query_path = "bigann_query.bvecs";
     let gt_i_path = "idx_100M.ivecs";
