@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/diskann_rs?style=for-the-badge&logo=docs.rs&color=mediumseagreen)](https://docs.rs/diskann_rs/latest/diskann_rs/)
 
 
-A Rust implementation of [DiskANN]() (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. This project provides an efficient and scalable solution for large-scale vector similarity search with minimal memory footprint, as an alternative to the widely used in-memory [HNSW](https://crates.io/crates/hnsw_rs) algorithm.
+A Rust implementation of [DiskANN]() (Disk-based Approximate Nearest Neighbor search) using the Vamana graph algorithm. This project provides an efficient and scalable solution for large-scale vector similarity search with minimal memory footprint, as an alternative to the widely used in-memory [HNSW](https://crates.io/crates/hnsw_rs) algorithm. 
 
 ## Overview
 
@@ -194,7 +194,7 @@ parallel insertion
  searching with ef : 24
  
  parallel search
-total cpu time for search requests 3838731.0 , system time 263571.0 
+total cpu time for search requests 3838.7310ms , system time 263.571ms 
 
  mean fraction nb returned by search 1.0 
 
