@@ -164,7 +164,7 @@ cargo run --release --example diskann_sift
 See the `examples/` directory for:
 - `demo.rs`: Demo with 100k vectors  
 - `perf_test.rs`: Performance benchmarking with 1M vectors
-- `diskann_mnist.rs`: Performance benchmarking with MNIST fashion dataset
+- `diskann_mnist.rs`: Performance benchmarking with MNIST fashion dataset (60K)
 - `diskann_sift.rs`: Performance benchmarking with SIFT 1M dataset
 
 ## Benchmark against HNSW ([hnsw_rs](https://crates.io/crates/hnsw_rs) crate)
