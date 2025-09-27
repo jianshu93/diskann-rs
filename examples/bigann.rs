@@ -8,7 +8,7 @@
 //!
 //! Notes:
 //! - This example converts u8 BVECs to f32 and builds an *in-memory* index
-//!   (then mmaps it). Building on the full 100M dataset requires a lot of RAM.
+//!   (then mmaps it). Building on the full dataset requires a lot of RAM.
 //!   Adjust NB_DATA_POINTS to a subset if needed.
 
 use std::fs::{File, OpenOptions};
@@ -257,8 +257,8 @@ fn main() {
     // download all data here: http://corpus-texmex.irisa.fr (ANN_SIFT1B)
     let base_path = "bigann_base.bvecs";
     let query_path = "bigann_query.bvecs";
-    let gt_i_path = "idx_100M.ivecs";
-    let gt_f_path = "dis_100M.fvecs";
+    let gt_i_path = "idx_10M.ivecs";
+    let gt_f_path = "dis_10M.fvecs";
 
     // Build or open index
     let index = build_or_load_index(base_path, INDEX_PATH, NB_DATA_POINTS);
