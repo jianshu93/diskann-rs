@@ -1,10 +1,10 @@
 //! examples/bigann.rs
 //!
-//! BigANN-style runner for diskann-rs.
+//! BigANN for diskann-rs.
 //! - expects these files in the repository root:
 //!     bigann_base.bvecs, bigann_query.bvecs, dis_100M.fvecs, idx_100M.ivecs
-//! - builds (or reuses) a DiskANN index at "diskann_index.db"
-//! - runs recall@10 and recall@100 on the first 10k queries
+//! - builds (or reuses) a DiskANN index at "big_diskann_index.db"
+//! - runs recall@10 and recall@100 on the first 100k queries
 //!
 //! Notes:
 //! - This example converts u8 BVECs to f32 and builds an *in-memory* index
@@ -34,7 +34,7 @@ const INDEX_PATH: &str = "big_diskann_index.db";
 
 // DiskANN build/search knobs (feel free to tweak).
 const DISKANN_PARAMS: DiskAnnParams = DiskAnnParams {
-    max_degree: 64,
+    max_degree: 48,
     build_beam_width: 256,
     alpha: 1.2,
 };
