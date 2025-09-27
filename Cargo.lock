@@ -177,6 +177,7 @@ dependencies = [
  "anndists",
  "bincode",
  "bytemuck",
+ "byteorder",
  "cpu-time",
  "hdf5-metno",
  "log",
